@@ -1,0 +1,1407 @@
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" ><generator uri="https://jekyllrb.com/" version="4.0.0">Jekyll</generator><link href="https://fzakaria.com/feed.xml" rel="self" type="application/atom+xml" /><link href="https://fzakaria.com/" rel="alternate" type="text/html" /><updated>2021-09-10T19:37:22-07:00</updated><id>https://fzakaria.com/feed.xml</id><title type="html">Farid Zakaria’s Blog</title><subtitle>I'm a software engineer, father and wishful amateur surfer. If you've come seeking my political views; you've found the wrong &lt;a href=&quot;https://fareedzakaria.com/&quot;&gt;Fareed&lt;/a&gt;.</subtitle><entry><title type="html">Using an overlay filesystem to improve Nix CI builds</title><link href="https://fzakaria.com/2021/09/10/using-an-overlay-filesystem-to-improve-nix-ci-builds.html" rel="alternate" type="text/html" title="Using an overlay filesystem to improve Nix CI builds" /><published>2021-09-10T08:58:00-07:00</published><updated>2021-09-10T08:58:00-07:00</updated><id>https://fzakaria.com/2021/09/10/using-an-overlay-filesystem-to-improve-nix-ci-builds</id><content type="html" xml:base="https://fzakaria.com/2021/09/10/using-an-overlay-filesystem-to-improve-nix-ci-builds.html">&lt;p&gt;Using Nix in our CI system has been a huge &lt;em&gt;boon&lt;/em&gt;. Through Nix we have a level of guarantee of reproducibility between our local development environment and our CI platform. 🙌&lt;/p&gt;
+
+&lt;p&gt;Our CI infrastructure leverages containers (don’t they all now?) for each job and we explored different solutions to reduce the cost of constantly downloading the &lt;em&gt;/nix/store&lt;/em&gt; necessary for the build.&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;h2 id=&quot;fat-docker-image&quot;&gt;Fat Docker image&lt;/h2&gt;
+
+&lt;p&gt;At first, we implemented a solution where the &lt;em&gt;/nix/store&lt;/em&gt; was embedded within the Docker image itself.&lt;/p&gt;
+
+&lt;p&gt;This was an interesting choice for a few reasons:&lt;/p&gt;
+&lt;ol&gt;
+  &lt;li&gt;We could disable building from source or any substituters in the build and guarantee the image itself had the complete necessary dependency closure.&lt;/li&gt;
+  &lt;li&gt;The images themselves are cached locally on the underlying host, meaning subsequent CI jobs don’t pay the cost of downloading &lt;em&gt;/nix/store&lt;/em&gt; contents&lt;/li&gt;
+  &lt;li&gt;Changes to our dependency closure were annoying since it required rebuilding a new Docker image&lt;/li&gt;
+  &lt;li&gt;The docker image was very large and minor changes resulted in a complete new large layer – it wasn’t incremental at all.&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;h2 id=&quot;overlay-filesystem&quot;&gt;Overlay Filesystem&lt;/h2&gt;
+
+&lt;p&gt;We decided to seek out alternatives where we can remove the prebuild &lt;em&gt;/nix/store&lt;/em&gt; from the container but still reduce the cold-boot cost for CI jobs.&lt;/p&gt;
+
+&lt;p&gt;The &lt;strong&gt;caveat&lt;/strong&gt; to the solution we seeked is that the Docker image still &lt;strong&gt;installed&lt;/strong&gt; Nix which meant it created a &lt;em&gt;/nix/store&lt;/em&gt; entry and the necessary &lt;em&gt;~/.nix_profile&lt;/em&gt; symlinks.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;&lt;a href=&quot;https://github.com/torvalds/linux/commit/e9be9d5e76e34872f0c37d72e25bc27fe9e2c54c&quot;&gt;Overlayfs&lt;/a&gt; allows one, usually read-write, directory tree to be
+overlaid onto another, read-only directory tree.  All modifications
+go to the upper, writable layer.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Let’s explore how we might go about setting this up! Let’s use a &lt;em&gt;dummy example&lt;/em&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-dockerfile highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;k&quot;&gt;FROM&lt;/span&gt;&lt;span class=&quot;s&quot;&gt; ubuntu&lt;/span&gt;
+
+&lt;span class=&quot;c&quot;&gt;# Let's make a dummy nix-store&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;RUN &lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;mkdir&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-p&lt;/span&gt; /nix/store
+
+&lt;span class=&quot;c&quot;&gt;# let's put a dummy derivation&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;RUN &lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;echo&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;hello&quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; /nix/store/hello
+
+&lt;span class=&quot;c&quot;&gt;# a dummy command&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;CMD&lt;/span&gt;&lt;span class=&quot;s&quot;&gt; [&quot;/bin/bash&quot;]&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;I will also create some &lt;em&gt;dummy directories&lt;/em&gt; on my &lt;strong&gt;host&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;nb&quot;&gt;mkdir&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-p&lt;/span&gt; /tmp/fake-nix/&lt;span class=&quot;o&quot;&gt;{&lt;/span&gt;upper,workdir&lt;span class=&quot;o&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;nb&quot;&gt;echo&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;ping&quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; /tmp/fake-nix/upper/pong
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Let’s spin up a docker container.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c&quot;&gt;# lets run a docker and bind-mount of host /nix/store&lt;/span&gt;
+&lt;span class=&quot;c&quot;&gt;# in this case we called it /tmp/fake-nix&lt;/span&gt;
+&lt;span class=&quot;c&quot;&gt;# In reality this will be your host's /nix/store&lt;/span&gt;
+docker run &lt;span class=&quot;nt&quot;&gt;--privileged&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-v&lt;/span&gt; /tmp/fake-nix:/nix/store-host &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+           &lt;span class=&quot;nt&quot;&gt;-it&lt;/span&gt; &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;docker build &lt;span class=&quot;nb&quot;&gt;.&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--quiet&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt; /bin/bash
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Let’s check the contents of the &lt;em&gt;/nix/store&lt;/em&gt; originally.
+We see that it only has out &lt;em&gt;hello&lt;/em&gt; file.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; /nix/store
+hello
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Now let’s mount our overlay filesystem.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;root@c32024e56f25:/# mount &lt;span class=&quot;nt&quot;&gt;-t&lt;/span&gt; overlay overlay &lt;span class=&quot;nt&quot;&gt;-o&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\ &lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;lowerdir&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/nix/store,upperdir&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/nix/store-host/upper,workdir&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;/nix/store-host/workdir &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+        /nix/store
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Let’s check the contents of our &lt;em&gt;/nix/store&lt;/em&gt; now.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-l&lt;/span&gt; /nix/store
+total 8
+&lt;span class=&quot;nt&quot;&gt;-rw-r--r--&lt;/span&gt; 1 root   root  6 Sep  9 17:15 hello
+&lt;span class=&quot;nt&quot;&gt;-rw-r--r--&lt;/span&gt; 1 780412 89939 5 Sep 10 16:22 pong
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Great! Our &lt;em&gt;/nix/store&lt;/em&gt; now has the contents of the host overlaid ontop of the one within the container.&lt;/p&gt;
+
+&lt;p&gt;What if we write a new file?&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;echo&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;test&quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; /nix/store/test
+
+root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; /nix/store
+hello  pong  &lt;span class=&quot;nb&quot;&gt;test
+
+&lt;/span&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; /nix/store-host/upper/
+pong  &lt;span class=&quot;nb&quot;&gt;test&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;We see that it created the file in the &lt;em&gt;upper&lt;/em&gt; directory.&lt;/p&gt;
+
+&lt;p&gt;What if we update a file in the &lt;em&gt;lower&lt;/em&gt; directory?&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;echo&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;world&quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; /nix/store/hello
+
+root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; /nix/store-host/upper/
+hello  pong  &lt;span class=&quot;nb&quot;&gt;test&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Ok cool – it moved it to our &lt;em&gt;upper&lt;/em&gt; directory.&lt;/p&gt;
+
+&lt;p&gt;What if we delete the file?&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;rm&lt;/span&gt; /nix/store/hello
+
+root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; /nix/store            
+pong  &lt;span class=&quot;nb&quot;&gt;test
+
+&lt;/span&gt;root@c32024e56f25:/# &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-l&lt;/span&gt; /nix/store-host/upper      
+total 8
+c--------- 2 root   root  0, 0 Sep 11 02:22 hello
+&lt;span class=&quot;nt&quot;&gt;-rw-r--r--&lt;/span&gt; 1 780412 89939    5 Sep 10 16:22 pong
+&lt;span class=&quot;nt&quot;&gt;-rw-r--r--&lt;/span&gt; 1 root   root     5 Sep 11 02:19 &lt;span class=&quot;nb&quot;&gt;test&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The &lt;em&gt;hello&lt;/em&gt; file still exists in the &lt;em&gt;upper&lt;/em&gt; directory but it’s a tombstone file now.
+This is to distinguish it from the fact it’s been deleted while still existing in the &lt;em&gt;lower&lt;/em&gt; directory.&lt;/p&gt;
+
+&lt;p&gt;Awesome – what’s great too is that the overlay filesystem that’s supported natively in Linux gives you near native performance.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;The implementation differs from other “union filesystem”
+implementations in that after a file is opened all operations go
+directly to the underlying, lower or upper, filesystems.  This
+simplifies the implementation and allows native performance in these
+cases.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Hope that helps others in trying to speedup their builds. 🤓&lt;/p&gt;</content><author><name></name></author><summary type="html">Using Nix in our CI system has been a huge boon. Through Nix we have a level of guarantee of reproducibility between our local development environment and our CI platform. 🙌 Our CI infrastructure leverages containers (don’t they all now?) for each job and we explored different solutions to reduce the cost of constantly downloading the /nix/store necessary for the build.</summary></entry><entry><title type="html">The yak shave for reproducibility</title><link href="https://fzakaria.com/2021/09/02/the-yak-shave-for-reproducibility.html" rel="alternate" type="text/html" title="The yak shave for reproducibility" /><published>2021-09-02T18:01:00-07:00</published><updated>2021-09-02T18:01:00-07:00</updated><id>https://fzakaria.com/2021/09/02/the-yak-shave-for-reproducibility</id><content type="html" xml:base="https://fzakaria.com/2021/09/02/the-yak-shave-for-reproducibility.html">&lt;p&gt;I have been on a mission to bring reproducibility through the use of &lt;a href=&quot;http://nixos.org/&quot;&gt;Nix&lt;/a&gt; into my workplace as we envision the next version of our development environment.&lt;/p&gt;
+
+&lt;p&gt;Similar to the movies I watch that take place in space, it only takes a small hole to destroy your hermetic environment. 🧑‍🚀&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;I’ve &lt;a href=&quot;/2020/11/12/debugging-a-jnr-ffi-bug-in-nix.html&quot;&gt;written previously&lt;/a&gt; about my encounters trying to remove all impurities within a JVM environment.&lt;/p&gt;
+
+&lt;p&gt;I’ve actually &lt;a href=&quot;https://github.com/NixOS/nixpkgs/pull/123708&quot;&gt;upstreamed&lt;/a&gt; fixing the default &lt;em&gt;java.library.path&lt;/em&gt; for the OpenJDK distributed by Nixpkgs. 🙌&lt;/p&gt;
+
+&lt;p&gt;Awesome! That should have solved my problem, right ?…&lt;/p&gt;
+
+&lt;p&gt;Unfortunately, &lt;em&gt;impurities&lt;/em&gt; are tough to stamp out. NixOS is trying to accomplish a paradigm shift by dismissing the &lt;em&gt;&lt;a href=&quot;https://en.wikipedia.org/wiki/Filesystem_Hierarchy_Standard&quot;&gt;filesystem hierarchy standard&lt;/a&gt;&lt;/em&gt; but it is deeply rooted in assumptions when people build for Linux.&lt;/p&gt;
+
+&lt;p&gt;In my specific case, the search paths for the JNR libraries were &lt;a href=&quot;https://github.com/jnr/jnr-ffi/blob/2161d3d875869bdaf292b0e9267bb0fbdb0f3f2b/src/main/java/jnr/ffi/LibraryLoader.java#L511&quot;&gt;hardcoded&lt;/a&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-java highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c1&quot;&gt;// paths should have no duplicate entries and have insertion order&lt;/span&gt;
+&lt;span class=&quot;nc&quot;&gt;LinkedHashSet&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nc&quot;&gt;String&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;new&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;LinkedHashSet&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nc&quot;&gt;String&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;();&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;try&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addAll&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;getPropertyPaths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;jnr.ffi.library.path&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;));&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addAll&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;getPropertyPaths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;jaffl.library.path&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;));&lt;/span&gt;
+    &lt;span class=&quot;c1&quot;&gt;// Add JNA paths for compatibility&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addAll&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;getPropertyPaths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;jna.library.path&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;));&lt;/span&gt;
+    &lt;span class=&quot;c1&quot;&gt;// java.library.path should take care of Windows defaults&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;addAll&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;getPropertyPaths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;java.library.path&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;));&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;}&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;catch&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nc&quot;&gt;Exception&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;ignored&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;{&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nc&quot;&gt;Platform&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;getNativePlatform&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;().&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;isUnix&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;())&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;c1&quot;&gt;// order is intentional!&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;add&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;/usr/local/lib&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;add&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;/usr/lib&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;n&quot;&gt;paths&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;add&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;/lib&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;);&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;I’ve sent &lt;a href=&quot;https://github.com/jnr/jnr-ffi/pull/264/&quot;&gt;a fix upstream&lt;/a&gt; please feel free to comment.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;This meant that I had to make sure the &lt;em&gt;java.library.path&lt;/em&gt; resolved to the &lt;em&gt;glibc&lt;/em&gt; I am using in Nixpkgs first.&lt;/p&gt;
+
+&lt;p&gt;I couldn’t get rid of the &lt;code class=&quot;highlighter-rouge&quot;&gt;JAVA_TOOL_OPTIONS&lt;/code&gt; just yet. 😤&lt;/p&gt;
+
+&lt;h2 id=&quot;whats-the-cost-of-all-this&quot;&gt;What’s the cost of all this?&lt;/h2&gt;
+
+&lt;p&gt;First off, the JDK emits &lt;code class=&quot;highlighter-rouge&quot;&gt;JAVA_TOOL_OPTIONS&lt;/code&gt; via &lt;em&gt;stderr&lt;/em&gt; which is &lt;a href=&quot;https://github.com/AdoptOpenJDK/openjdk-jdk8u/blob/9a751dc19fae78ce58fb0eb176522070c992fb6f/hotspot/src/share/vm/runtime/arguments.cpp#L3753&quot;&gt;non-configurable&lt;/a&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-c highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;os&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;getenv&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;buffer&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;sizeof&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;buffer&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;amp;&amp;amp;&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;!&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;os&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;have_special_privileges&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;())&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;JavaVMOption&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;options&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;N_MAX_OPTIONS&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;      &lt;span class=&quot;c1&quot;&gt;// Construct option array&lt;/span&gt;
+  &lt;span class=&quot;n&quot;&gt;jio_fprintf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;defaultStream&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;error_stream&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(),&lt;/span&gt;
+            &lt;span class=&quot;s&quot;&gt;&quot;Picked up %s: %s&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\n&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;buffer&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;This is frustrating because plenty of tools (i.e. IntelliJ) assume failure if anything is emitted to &lt;em&gt;stderr&lt;/em&gt;.&lt;/p&gt;
+
+&lt;p&gt;Secondly, we have many developers that are being hit by this particular workflow:&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;Developer sets up their IntelliJ JRuby SDK to point to Jruby which points to &lt;em&gt;/nix/store&lt;/em&gt; path &lt;strong&gt;A&lt;/strong&gt; linked with glibc &lt;strong&gt;B&lt;/strong&gt;.&lt;/li&gt;
+  &lt;li&gt;Developer changes their Git branch to a different point in time where JRuby points to a different &lt;em&gt;/nix/store&lt;/em&gt; path &lt;strong&gt;X&lt;/strong&gt; linked with glibc &lt;strong&gt;Z&lt;/strong&gt;.&lt;/li&gt;
+  &lt;li&gt;The developer restarts IntelliJ and picks up the new environment variable &lt;em&gt;JAVA_TOOL_OPTIONS&lt;/em&gt; 💥&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;If you read &lt;a href=&quot;/2020/11/12/debugging-a-jnr-ffi-bug-in-nix.html&quot;&gt;my earlier post&lt;/a&gt;, you’ll understand why &lt;em&gt;JAVA_TOOL_OPTIONS&lt;/em&gt; includes glibc.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;That &lt;em&gt;JAVA_TOOL_OPTIONS&lt;/em&gt; references glibc &lt;strong&gt;Z&lt;/strong&gt; but their JRuby SDK is pointing to JRuby &lt;strong&gt;A&lt;/strong&gt; which was built against glibc &lt;strong&gt;B&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;They are then graced with this &lt;em&gt;wonderful&lt;/em&gt; message.&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;java.lang.UnsatisfiedLinkError: /nix/store/cvr0kjg2q7z2wwhjblx6c73rv422k8cm-glibc-2.33-47/lib/libc.so.6: undefined symbol: _dl_catch_error_ptr, version GLIBC_PRIVATE
+	at jnr.ffi.provider.jffi.NativeLibrary.loadNativeLibraries(NativeLibrary.java:93)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Ugh! The fix here is straightforward ultimately – the developer needs to be mindful of their JRuby SDK set in IntelliJ and keep it in sync with their local checkout.&lt;/p&gt;
+
+&lt;p&gt;Unfortunately it’s a sharp edge many are running into; and I don’t blame them!&lt;/p&gt;
+
+&lt;p&gt;We will be thinking of some sane ways to keep these two tools in sync so that we can remain on upstream for now… 🤔&lt;/p&gt;</content><author><name></name></author><summary type="html">I have been on a mission to bring reproducibility through the use of Nix into my workplace as we envision the next version of our development environment. Similar to the movies I watch that take place in space, it only takes a small hole to destroy your hermetic environment. 🧑‍🚀</summary></entry><entry><title type="html">A Nix Binary Cache Specification</title><link href="https://fzakaria.com/2021/08/12/a-nix-binary-cache-specification.html" rel="alternate" type="text/html" title="A Nix Binary Cache Specification" /><published>2021-08-12T14:20:00-07:00</published><updated>2021-08-12T14:20:00-07:00</updated><id>https://fzakaria.com/2021/08/12/a-nix-binary-cache-specification</id><content type="html" xml:base="https://fzakaria.com/2021/08/12/a-nix-binary-cache-specification.html">&lt;p&gt;I wanted to better understand how to work with Nix binary caches. Interestingly the Nix manual which usually is a great source of knowledge, has &lt;a href=&quot;https://nixos.org/manual/nix/unstable/package-management/binary-cache-substituter.html&quot;&gt;a very limited section&lt;/a&gt; on the Binary Cache.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;It basically just points you to &lt;a href=&quot;https://github.com/edolstra/nix-serve/&quot;&gt;nix-serve&lt;/a&gt;, a Perl CGI script in &lt;a href=&quot;https://github.com/edolstra&quot;&gt;Eelco’s&lt;/a&gt; (original author of Nix) personal repository.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;This guide will serve to be a &lt;em&gt;loose&lt;/em&gt; Nix Binary Cache specification.
+If you are interested in browsing the end result, please checkout my &lt;a href=&quot;https://fzakaria.github.io/nix-http-binary-cache-api-spec&quot;&gt;OpenAPI Nix HTTP Binary Cache Specification&lt;/a&gt; 🎆&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;You can also visit the GitHub repository &lt;a href=&quot;https://github.com/fzakaria/nix-http-binary-cache-api-spec&quot;&gt;https://github.com/fzakaria/nix-http-binary-cache-api-spec&lt;/a&gt; to contribute.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;Since there’s no specification (aside from the code), I will use the canonical binary cache &lt;a href=&quot;https://cache.nixos.org&quot;&gt;https://cache.nixos.org&lt;/a&gt; and using &lt;em&gt;Ruby&lt;/em&gt; for investigation.&lt;/p&gt;
+
+&lt;p&gt;Let’s start off and use &lt;code class=&quot;highlighter-rouge&quot;&gt;nix path-info&lt;/code&gt; to query some information. I find it always more useful to use &lt;code class=&quot;highlighter-rouge&quot;&gt;--json&lt;/code&gt; to see the displayed results.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix path-info nixpkgs.ruby &lt;span class=&quot;nt&quot;&gt;--store&lt;/span&gt; https://cache.nixos.org &lt;span class=&quot;nt&quot;&gt;--json&lt;/span&gt; | jq
+&lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;
+  &lt;span class=&quot;o&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;s2&quot;&gt;&quot;path&quot;&lt;/span&gt;: &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3&quot;&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;narHash&quot;&lt;/span&gt;: &lt;span class=&quot;s2&quot;&gt;&quot;sha256:1impfw8zdgisxkghq9a3q7cn7jb9zyzgxdydiamp8z2nlyyl0h5h&quot;&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;narSize&quot;&lt;/span&gt;: 18735072,
+    &lt;span class=&quot;s2&quot;&gt;&quot;references&quot;&lt;/span&gt;: &lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/0d71ygfwbmy1xjlbj1v027dfmy9cqavy-libffi-3.3&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/0dbbrvlw2rahvzi69bmpqy1z9mvzg62s-gdbm-1.19&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/0i6vphc3vnr8mg0gxjr61564hnp0s2md-gnugrep-3.6&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/0vkw1m51q34dr64z5i87dy99an4hfmyg-coreutils-8.32&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/64ylsrpd025kcyi608w3dqckzyz57mdc-libyaml-0.2.5&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/65ys3k6gn2s27apky0a0la7wryg3az9q-zlib-1.2.11&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/9m4hy7cy70w6v2rqjmhvd7ympqkj6yxk-ncurses-6.2&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/a4yw1svqqk4d8lhwinn9xp847zz9gfma-bash-4.4-p23&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/hbm0951q7xrl4qd0ccradp6bhjayfi4b-openssl-1.1.1k&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/hjwjf3bj86gswmxva9k40nqx6jrb5qvl-readline-6.3p08&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3&quot;&lt;/span&gt;,
+      &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/sbbifs2ykc05inws26203h0xwcadnf0l-glibc-2.32-46&quot;&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;]&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;deriver&quot;&lt;/span&gt;: &lt;span class=&quot;s2&quot;&gt;&quot;/nix/store/bidkcs01mww363s4s7akdhbl6ws66b0z-ruby-2.7.3.drv&quot;&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;signatures&quot;&lt;/span&gt;: &lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;
+      &lt;span class=&quot;s2&quot;&gt;&quot;cache.nixos.org-1:GrGV/Ls10TzoOaCnrcAqmPbKXFLLSBDeGNh5EQGKyuGA4K1wv1LcRVb6/sU+NAPK8lDiam8XcdJzUngmdhfTBQ==&quot;&lt;/span&gt;
+    &lt;span class=&quot;o&quot;&gt;]&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;url&quot;&lt;/span&gt;: &lt;span class=&quot;s2&quot;&gt;&quot;nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz&quot;&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;downloadHash&quot;&lt;/span&gt;: &lt;span class=&quot;s2&quot;&gt;&quot;sha256:1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3&quot;&lt;/span&gt;,
+    &lt;span class=&quot;s2&quot;&gt;&quot;downloadSize&quot;&lt;/span&gt;: 4029176
+  &lt;span class=&quot;o&quot;&gt;}&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;]&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;How did the Nix tool determine this information and what does it mean? 🕵️&lt;/p&gt;
+
+&lt;p&gt;Every Nix Binary Cache needs to support querying for &lt;a href=&quot;https://hackage.haskell.org/package/nix-narinfo-0.1.0.1/docs/Nix-NarInfo.html&quot;&gt;NARInfo&lt;/a&gt; files for a particular store path.&lt;/p&gt;
+
+&lt;p&gt;For instance for our Ruby path &lt;em&gt;/nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3&lt;/em&gt;, we take the cryptographic hash portion and use that to cURL the metadata &lt;a href=&quot;https://cache.nixos.org/p4pclmv1gyja5kzc26npqpia1qqxrf0l.narinfo&quot;&gt;https://cache.nixos.org/p4pclmv1gyja5kzc26npqpia1qqxrf0l.narinfo&lt;/a&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ curl &lt;span class=&quot;nt&quot;&gt;-i&lt;/span&gt; https://cache.nixos.org/p4pclmv1gyja5kzc26npqpia1qqxrf0l.narinfo
+HTTP/2 200 
+x-amz-id-2: Qpz5ZRR31fiF+A3lN9Gl5SVP1kC4/9jgEWUibbFX/p+rVazDVznQMtT4qgskwlkDcwOtDGtegjY&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;
+x-amz-request-id: 5G9ZDZB9TFR665RN
+last-modified: Wed, 19 May 2021 10:43:55 GMT
+etag: &lt;span class=&quot;s2&quot;&gt;&quot;0faa37071023836830facecbcf99b384&quot;&lt;/span&gt;
+content-type: text/x-nix-narinfo
+server: AmazonS3
+via: 1.1 varnish, 1.1 varnish
+accept-ranges: bytes
+&lt;span class=&quot;nb&quot;&gt;date&lt;/span&gt;: Thu, 12 Aug 2021 21:39:39 GMT
+age: 47939
+x-served-by: cache-bwi5123-BWI, cache-pao17429-PAO
+x-cache: HIT, HIT
+x-cache-hits: 1, 1
+x-timer: S1628804380.563848,VS0,VE0
+content-length: 1058
+
+StorePath: /nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3
+URL: nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz
+Compression: xz
+FileHash: sha256:1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3
+FileSize: 4029176
+NarHash: sha256:1impfw8zdgisxkghq9a3q7cn7jb9zyzgxdydiamp8z2nlyyl0h5h
+NarSize: 18735072
+References: 0d71ygfwbmy1xjlbj1v027dfmy9cqavy-libffi-3.3 0dbbrvlw2rahvzi69bmpqy1z9mvzg62s-gdbm-1.19 0i6vphc3vnr8mg0gxjr61564hnp0s2md-gnugrep-3.6 0vkw1m51q34dr64z5i87dy99an4hfmyg-coreutils-8.32 64ylsrpd025kcyi608w3dqckzyz57mdc-libyaml-0.2.5 65ys3k6gn2s27apky0a0la7wryg3az9q-zlib-1.2.11 9m4hy7cy70w6v2rqjmhvd7ympqkj6yxk-ncurses-6.2 a4yw1svqqk4d8lhwinn9xp847zz9gfma-bash-4.4-p23 hbm0951q7xrl4qd0ccradp6bhjayfi4b-openssl-1.1.1k hjwjf3bj86gswmxva9k40nqx6jrb5qvl-readline-6.3p08 p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3 sbbifs2ykc05inws26203h0xwcadnf0l-glibc-2.32-46
+Deriver: bidkcs01mww363s4s7akdhbl6ws66b0z-ruby-2.7.3.drv
+Sig: cache.nixos.org-1:GrGV/Ls10TzoOaCnrcAqmPbKXFLLSBDeGNh5EQGKyuGA4K1wv1LcRVb6/sU+NAPK8lDiam8XcdJzUngmdhfTBQ&lt;span class=&quot;o&quot;&gt;==&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;We see that it points to another URL at &lt;em&gt;nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz&lt;/em&gt;.&lt;/p&gt;
+
+&lt;p&gt;Let’s get some statistics about it.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;NAR is the Nix ARchive. Not all archive formats are reproducible, so Nix had to create it’s own!&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-hash &lt;span class=&quot;nt&quot;&gt;--type&lt;/span&gt; sha256 &lt;span class=&quot;nt&quot;&gt;--flat&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+       &lt;span class=&quot;nt&quot;&gt;--base32&lt;/span&gt; &amp;lt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;curl &lt;span class=&quot;nt&quot;&gt;--silent&lt;/span&gt; https://cache.nixos.org/nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+
+1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Cool 😎! Looks like we computed the correct hash for the &lt;em&gt;FileHash&lt;/em&gt;.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;How did I know it was base32! Everything in Nix is base32 😞
+This is needed to shrink the necessary space to work within the POSIX filepath limits.
+Frustratingly, &lt;a href=&quot;https://linux.die.net/man/1/sha256sum&quot;&gt;sha256sum&lt;/a&gt; doesn’t have a base32 option.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;The NAR hash should be calcuated in a very similar fashion.&lt;/p&gt;
+
+&lt;p&gt;Let’s try by piping it into &lt;a href=&quot;https://linux.die.net/man/1/unxz&quot;&gt;unxz&lt;/a&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-hash &lt;span class=&quot;nt&quot;&gt;--type&lt;/span&gt; sha256 &lt;span class=&quot;nt&quot;&gt;--flat&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+       &lt;span class=&quot;nt&quot;&gt;--base32&lt;/span&gt; &amp;lt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;curl &lt;span class=&quot;nt&quot;&gt;--silent&lt;/span&gt; https://cache.nixos.org/nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz | unxz&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+1impfw8zdgisxkghq9a3q7cn7jb9zyzgxdydiamp8z2nlyyl0h5h
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;What about &lt;em&gt;References&lt;/em&gt;, what’s that?&lt;/p&gt;
+
+&lt;p&gt;We see a very similar concept in the &lt;code class=&quot;highlighter-rouge&quot;&gt;nix-store --query&lt;/code&gt; CLI and it produces the same list.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-store &lt;span class=&quot;nt&quot;&gt;--query&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;--references&lt;/span&gt; /nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3
+
+/nix/store/sbbifs2ykc05inws26203h0xwcadnf0l-glibc-2.32-46
+/nix/store/0d71ygfwbmy1xjlbj1v027dfmy9cqavy-libffi-3.3
+/nix/store/0dbbrvlw2rahvzi69bmpqy1z9mvzg62s-gdbm-1.19
+/nix/store/0i6vphc3vnr8mg0gxjr61564hnp0s2md-gnugrep-3.6
+/nix/store/0vkw1m51q34dr64z5i87dy99an4hfmyg-coreutils-8.32
+/nix/store/64ylsrpd025kcyi608w3dqckzyz57mdc-libyaml-0.2.5
+/nix/store/65ys3k6gn2s27apky0a0la7wryg3az9q-zlib-1.2.11
+/nix/store/9m4hy7cy70w6v2rqjmhvd7ympqkj6yxk-ncurses-6.2
+/nix/store/a4yw1svqqk4d8lhwinn9xp847zz9gfma-bash-4.4-p23
+/nix/store/hbm0951q7xrl4qd0ccradp6bhjayfi4b-openssl-1.1.1k
+/nix/store/hjwjf3bj86gswmxva9k40nqx6jrb5qvl-readline-6.3p08
+/nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;–references
+      Prints the set of references of the store paths paths, that is, their immediate dependencies.
+      (For all dependencies, use –requisites.)&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Looks like it just prints the &lt;strong&gt;immediate dependencies&lt;/strong&gt;. 
+In order for our &lt;em&gt;Ruby&lt;/em&gt; to run successfully on a machine, one would have to though download the &lt;strong&gt;full transitive closure of runtime dependencies&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;If we &lt;em&gt;extract&lt;/em&gt; the NAR above, we see it’s just the contents of our Nix derivation.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ curl &lt;span class=&quot;nt&quot;&gt;--silent&lt;/span&gt; https://cache.nixos.org/nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+       | unxz | nix-store &lt;span class=&quot;nt&quot;&gt;--restore&lt;/span&gt; /tmp/ruby
+
+❯ &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-l&lt;/span&gt; /tmp/ruby
+
+drwxr-xr-x - fmzakari 12 Aug 15:16 bin
+drwxr-xr-x - fmzakari 12 Aug 15:16 include
+drwxr-xr-x - fmzakari 12 Aug 15:16 lib
+drwxr-xr-x - fmzakari 12 Aug 15:16 nix-support
+drwxr-xr-x - fmzakari 12 Aug 15:16 share
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Finally browsing the &lt;em&gt;nix-serve&lt;/em&gt; source, I see there’s a &lt;em&gt;/nix-cache-info&lt;/em&gt; path.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ curl https://cache.nixos.org/nix-cache-info
+StoreDir: /nix/store
+WantMassQuery: 1
+Priority: 40
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;It seems to give some information about this particular cache.&lt;/p&gt;
+
+&lt;p&gt;The important one is the &lt;em&gt;StoreDir&lt;/em&gt; since the store-path is part of the build recipe.
+When you build a derivation, the Nix store directory is encoded within.&lt;/p&gt;
+
+&lt;p&gt;If you pick an arbitrary Nix store dir such as &lt;code class=&quot;highlighter-rouge&quot;&gt;~/nix/store&lt;/code&gt; you will be unable to use
+the default NixOS binary cache.&lt;/p&gt;
+
+&lt;p&gt;For instance, even though above I extracted the Ruby NAR to &lt;strong&gt;/tmp/ruby&lt;/strong&gt;, if we read where
+it expects to find the dynamic libraries, we see it still references &lt;em&gt;/nix/store&lt;/em&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ ldd /tmp/ruby/bin/ruby
+	linux-vdso.so.1 &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;0x00007ffd6e57b000&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+	libruby-2.7.3.so.2.7 &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; /nix/store/p4pclmv1gyja5kzc26npqpia1qqxrf0l-ruby-2.7.3/lib/libruby-2.7.3.so.2.7 &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;0x00007f7a819e2000&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+    ibz.so.1 &lt;span class=&quot;o&quot;&gt;=&amp;gt;&lt;/span&gt; /nix/store/65ys3k6gn2s27apky0a0la7wryg3az9q-zlib-1.2.11/lib/libz.so.1 &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;0x00007f7a819c5000&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+...
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Wow! I ended up encoding this discovery into an &lt;a href=&quot;https://swagger.io/resources/open-api/&quot;&gt;OpenAPI&lt;/a&gt; specification that you can check out.&lt;/p&gt;
+
+&lt;p&gt;Please visit &lt;a href=&quot;https://fzakaria.github.io/nix-http-binary-cache-api-spec/#/&quot;&gt;https://fzakaria.github.io/nix-http-binary-cache-api-spec/#/&lt;/a&gt; or contribute to the specification at &lt;a href=&quot;https://github.com/fzakaria/nix-http-binary-cache-api-spec&quot;&gt;https://github.com/fzakaria/nix-http-binary-cache-api-spec&lt;/a&gt;.&lt;/p&gt;</content><author><name></name></author><summary type="html">I wanted to better understand how to work with Nix binary caches. Interestingly the Nix manual which usually is a great source of knowledge, has a very limited section on the Binary Cache. It basically just points you to nix-serve, a Perl CGI script in Eelco’s (original author of Nix) personal repository. This guide will serve to be a loose Nix Binary Cache specification. If you are interested in browsing the end result, please checkout my OpenAPI Nix HTTP Binary Cache Specification 🎆 You can also visit the GitHub repository https://github.com/fzakaria/nix-http-binary-cache-api-spec to contribute.</summary></entry><entry><title type="html">Investigating hydration times with Nix</title><link href="https://fzakaria.com/2021/08/10/investigating-hydration-times-with-nix.html" rel="alternate" type="text/html" title="Investigating hydration times with Nix" /><published>2021-08-10T08:43:00-07:00</published><updated>2021-08-10T08:43:00-07:00</updated><id>https://fzakaria.com/2021/08/10/investigating-hydration-times-with-nix</id><content type="html" xml:base="https://fzakaria.com/2021/08/10/investigating-hydration-times-with-nix.html">&lt;blockquote&gt;
+  &lt;p&gt;📣 I want a give a huge shoutout to my colleague &lt;a href=&quot;https://www.linkedin.com/in/micah-catlin-0718991&quot;&gt;Micah Catlin&lt;/a&gt;, whose been constantly challenging me on questions on Nix – his analytical skills are 11/10. 🤓&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;We are working on a new build system using Nix as the underpinning framework. In order to smooth out the developer experience, we wanted to tackle a very simple question:&lt;/p&gt;
+
+&lt;p&gt;&lt;em&gt;“Can we force developers only to pull from the Nix binary cache?”&lt;/em&gt;&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;🤔 I did what you might typically do and visit the documentation for &lt;a href=&quot;https://nixos.org/manual/nix/unstable/command-ref/conf-file.html&quot;&gt;nix.conf&lt;/a&gt; where it lists.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;max-jobs&lt;/p&gt;
+
+  &lt;p&gt;This option defines the maximum number of jobs that Nix will try to build in parallel. The default is 1. The special value auto causes Nix to use the number of CPUs in your system. 0 is useful when using remote builders to prevent any local builds (except for preferLocalBuild derivation attribute which executes locally regardless). It can be overridden using the –max-jobs (-j) command line switch.&lt;/p&gt;
+
+  &lt;p&gt;Default: 1&lt;/p&gt;
+
+  &lt;p&gt;Deprecated alias: build-max-jobs&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;👌 Perfect! I answer the following and show an example:&lt;/p&gt;
+
+&lt;p&gt;“Sure, just set &lt;em&gt;max-jobs&lt;/em&gt; to zero in the configuration.”&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; lolhello.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; max-jobs 0
+these derivations will be built:
+  /nix/store/vwrgdjl9h1h53ch2zh8cb18nd2raz8a7-lolhello.drv
+these paths will be fetched &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;0.35 MiB download, 0.34 MiB unpacked&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;:
+  /nix/store/vgaqghyhgk3apb503q5483v8cmn32ggm-hello-2.3.tar.bz2
+error: 1 derivations need to be built, but neither &lt;span class=&quot;nb&quot;&gt;local &lt;/span&gt;builds &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;'--max-jobs'&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt; nor remote builds &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;'--builders'&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt; are enabled
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;My astute colleague however notices that setting up our &lt;em&gt;nix-shell&lt;/em&gt; now takes considerably longer. His hypothesis is that the &lt;em&gt;max-jobs&lt;/em&gt; when set to 0 now forces the downloading to become sequential.&lt;/p&gt;
+
+&lt;p&gt;Let’s test! 📝&lt;/p&gt;
+
+&lt;p&gt;First we will create a &lt;em&gt;large&lt;/em&gt; dummy Nix artifact.&lt;/p&gt;
+
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{};&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;with&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;with&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;with&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;make-large-derivation&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;derivation&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+        &lt;span class=&quot;kn&quot;&gt;inherit&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;system&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;builtins&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;currentSystem&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+        &lt;span class=&quot;nv&quot;&gt;builder&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;writeScript&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;builder.sh&quot;&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;            #!/bin/sh&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;            &lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;coreutils&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;/bin/dd if=/dev/urandom of=$out bs=64M count=16&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;        ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;a&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;make-large-derivation&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;a&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;b&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;make-large-derivation&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;b&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt;
+&lt;span class=&quot;kr&quot;&gt;derivation&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;test&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;system&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;builtins&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;currentSystem&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;builder&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;writeScript&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;builder.sh&quot;&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;        #!/bin/sh&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;        echo &lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt; &amp;gt;&amp;gt; $out&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;        echo &lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt; &amp;gt;&amp;gt; $out&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ &lt;span class=&quot;nb&quot;&gt;time &lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; large-dummy-a.nix
+these derivations will be built:
+  /nix/store/nk7gljxxv2g5c6n4x08sdhmrvmg8smph-builder.sh.drv
+  /nix/store/vgbgd05fcgas6imrm4xsgilsv8gx1jqm-b.drv
+  /nix/store/zcdqjiqvampv7k3n161vzb6vzk2m35an-a.drv
+  /nix/store/gll9fjjcsji6yvw4zg3lfcmwi9mn4v3w-builder.sh.drv
+  /nix/store/xyx3zxkvjrkchjsz7gb9kzp7j3kiwypz-test.drv
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/nk7gljxxv2g5c6n4x08sdhmrvmg8smph-builder.sh.drv'&lt;/span&gt;...
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/zcdqjiqvampv7k3n161vzb6vzk2m35an-a.drv'&lt;/span&gt;...
+/nix/store/0vkw1m51q34dr64z5i87dy99an4hfmyg-coreutils-8.32/bin/dd: warning: partial &lt;span class=&quot;nb&quot;&gt;read&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;33554431 bytes&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; suggest &lt;span class=&quot;nv&quot;&gt;iflag&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;fullblock
+0+16 records &lt;span class=&quot;k&quot;&gt;in
+&lt;/span&gt;0+16 records out
+536870896 bytes &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;537 MB, 512 MiB&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt; copied, 15.8208 s, 33.9 MB/s
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/vgbgd05fcgas6imrm4xsgilsv8gx1jqm-b.drv'&lt;/span&gt;...
+/nix/store/0vkw1m51q34dr64z5i87dy99an4hfmyg-coreutils-8.32/bin/dd: warning: partial &lt;span class=&quot;nb&quot;&gt;read&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;33554431 bytes&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; suggest &lt;span class=&quot;nv&quot;&gt;iflag&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;fullblock
+0+16 records &lt;span class=&quot;k&quot;&gt;in
+&lt;/span&gt;0+16 records out
+536870896 bytes &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;537 MB, 512 MiB&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt; copied, 15.18 s, 35.4 MB/s
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/gll9fjjcsji6yvw4zg3lfcmwi9mn4v3w-builder.sh.drv'&lt;/span&gt;...
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/xyx3zxkvjrkchjsz7gb9kzp7j3kiwypz-test.drv'&lt;/span&gt;...
+/nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; large-dummy-a.nix  3.24s user 31.37s system 94% cpu 36.506 total
+
+❯ &lt;span class=&quot;nb&quot;&gt;cat&lt;/span&gt; /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+
+/nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a
+/nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b
+
+❯ &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-lh&lt;/span&gt; /nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a
+
+Permissions Size User     Date Modified Name
+.r--r--r--  536M fmzakari 31 Dec  1969  /nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a
+❯ &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-lh&lt;/span&gt; /nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b
+
+Permissions Size User     Date Modified Name
+.r--r--r--  536M fmzakari 31 Dec  1969  /nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Building it from scratch takes &lt;strong&gt;31.37s&lt;/strong&gt; 🕒&lt;/p&gt;
+
+&lt;p&gt;I add the large derivations to &lt;code class=&quot;highlighter-rouge&quot;&gt;$out&lt;/code&gt; so it’s a runtime dependency&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-store &lt;span class=&quot;nt&quot;&gt;--query&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--tree&lt;/span&gt; /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+
+/nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
++---/nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b
++---/nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Let’s upload them both to cachix.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ cachix push fzakaria /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+compressing and pushing /nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;512.00 MiB&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+compressing and pushing /nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;512.00 MiB&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+compressing and pushing /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;208.00 B&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+All &lt;span class=&quot;k&quot;&gt;done&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;.&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;strong&gt;Don’t forget to cleanup these paths in between tests&lt;/strong&gt;&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-store &lt;span class=&quot;nt&quot;&gt;--delete&lt;/span&gt; /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+  nix-store &lt;span class=&quot;nt&quot;&gt;--delete&lt;/span&gt; /nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+  nix-store &lt;span class=&quot;nt&quot;&gt;--delete&lt;/span&gt; /nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Now let’s &lt;em&gt;time&lt;/em&gt; building it with jobs set to the &lt;em&gt;max-jobs&lt;/em&gt; set to 5.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ &lt;span class=&quot;nb&quot;&gt;time &lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; large-dummy-a.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; max-jobs 5
+these paths will be fetched &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;1024.05 MiB download, 1024.00 MiB unpacked&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;:
+  /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+  /nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b
+  /nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'https://fzakaria.cachix.org'&lt;/span&gt;...
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'https://fzakaria.cachix.org'&lt;/span&gt;...
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'https://fzakaria.cachix.org'&lt;/span&gt;...
+/nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; large-dummy-a.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; max-jobs 5  17.78s user 5.87s system 55% cpu 42.275 total
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Downloading it with the default number of jobs, takes &lt;strong&gt;17.78s&lt;/strong&gt; 🕒&lt;/p&gt;
+
+&lt;p&gt;Now let’s &lt;em&gt;time&lt;/em&gt; building it with jobs set to &lt;em&gt;0&lt;/em&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ &lt;span class=&quot;nb&quot;&gt;time &lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; large-dummy-a.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; max-jobs 0
+these paths will be fetched &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;1024.05 MiB download, 1024.00 MiB unpacked&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;:
+  /nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+  /nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b
+  /nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/ln0d29k6zfskhgvig4kyhcql0phxd4qw-a'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'https://fzakaria.cachix.org'&lt;/span&gt;...
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/ifc68r8i5dng7c4vmds81vl3gig6gfpr-b'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'https://fzakaria.cachix.org'&lt;/span&gt;...
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'https://fzakaria.cachix.org'&lt;/span&gt;...
+/nix/store/232rq7y1f09pn2amk3lcjqmws341vp3q-test
+nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; large-dummy-a.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; max-jobs 0  16.89s user 5.19s system 37% cpu 59.330 total
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Hmmm. It still takes the same amount of time roughly &lt;strong&gt;16.89s&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;I can’t seem to get a noticeable impact with my experiment. I did find another configuration parameter &lt;em&gt;http-connections&lt;/em&gt; that seems to affect more the concurrency of the downloads from the binary store.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;http-connections&lt;/p&gt;
+
+  &lt;p&gt;The maximum number of parallel TCP connections used to fetch files from binary caches and by other downloads. It defaults to 25. 0 means no limit.&lt;/p&gt;
+
+  &lt;p&gt;Default: 25&lt;/p&gt;
+
+  &lt;p&gt;Deprecated alias: binary-caches-parallel-connections&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Next step is to audit the source code and or think more about my experiment.
+Perhaps it’s not representative enough to show the problem he was noticing.&lt;/p&gt;</content><author><name></name></author><summary type="html">📣 I want a give a huge shoutout to my colleague Micah Catlin, whose been constantly challenging me on questions on Nix – his analytical skills are 11/10. 🤓 We are working on a new build system using Nix as the underpinning framework. In order to smooth out the developer experience, we wanted to tackle a very simple question: “Can we force developers only to pull from the Nix binary cache?”</summary></entry><entry><title type="html">The search for a minimal nix-shell continued; mkShellMinimal</title><link href="https://fzakaria.com/2021/08/05/the-search-for-a-minimal-nix-shell-continued-mkshellminimal.html" rel="alternate" type="text/html" title="The search for a minimal nix-shell continued; mkShellMinimal" /><published>2021-08-05T18:53:00-07:00</published><updated>2021-08-05T18:53:00-07:00</updated><id>https://fzakaria.com/2021/08/05/the-search-for-a-minimal-nix-shell-continued-mkshellminimal</id><content type="html" xml:base="https://fzakaria.com/2021/08/05/the-search-for-a-minimal-nix-shell-continued-mkshellminimal.html">&lt;blockquote&gt;
+  &lt;p&gt;“The simplest things are often the truest.” - Richard Bach, 1936.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Earlier &lt;a href=&quot;/2021/08/02/a-minimal-nix-shell.html&quot;&gt;I wrote about&lt;/a&gt; trying to get a minimal nix-shell. The goal and challenge of the post was about reducing the dependency closure size of the shell.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;I was asked what’s the point in trying to minimize the closure size ?&lt;/p&gt;
+
+  &lt;p&gt;We are using &lt;em&gt;nix-shell&lt;/em&gt; in our CI infrastructure and every CI job hydrates it’s own
+&lt;em&gt;/nix/store&lt;/em&gt; from scratch. Reducing the dependency closure size would mean faster CI runs. 🏎️&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;The post finished with a question, &lt;em&gt;“Can we do better ?”&lt;/em&gt;, to which I answered &lt;em&gt;“No, not at this time.”&lt;/em&gt;.&lt;/p&gt;
+
+&lt;p&gt;I’d like to introduce &lt;a href=&quot;https://github.com/NixOS/nixpkgs/pull/132617&quot;&gt;mkShellMinimal&lt;/a&gt; that does better 🎊&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;Let’s first look at a similar basic example, a &lt;em&gt;nix-shell&lt;/em&gt; without any user declared dependencies.&lt;/p&gt;
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;with&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;mkShellMinimal&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;my-minimal-shell&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;c&quot;&gt;# No user defined dependencies&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;packages&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+
+  &lt;span class=&quot;c&quot;&gt;# You can do typical environment variable setting&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;FOO&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;bar&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;If we check the closure size of our shell, we see that it’s only &lt;strong&gt;1.4KiB&lt;/strong&gt; 😮&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix path-info &lt;span class=&quot;nt&quot;&gt;-rSsh&lt;/span&gt; &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix-build shell.nix&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt; 
+This derivation is not meant to be built, unless you want to capture the dependency closure.
+
+/nix/store/8ka1hnlf06z3h2rpd00b4d9w5yxh0n39-setup        	 376.0 	 376.0
+/nix/store/nprykggfqhdkn4r5lxxknjvlqc4qm1yl-builder.sh   	 280.0 	 280.0
+/nix/store/xd8d72ccrxhaz3sxlmiqjnn1z0zwfhm8-my-minimal-shell	 744.0 	   1.4K
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;That’s nearly a &lt;strong&gt;200_000x&lt;/strong&gt; improvement. 😱&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;To facilitate a simpler way to introspect or upload the transitive closure of the shell, I’ve allowed it to be
+buildable.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;I’ve greatly simplified the feature set of what you can do with &lt;em&gt;mkShellMinimal&lt;/em&gt; as opposed to &lt;em&gt;mkShell&lt;/em&gt;.&lt;/p&gt;
+
+&lt;p&gt;For instance the only way to declare dependencies is with the &lt;em&gt;packages&lt;/em&gt; keyword. There is no dependency even on &lt;a href=&quot;https://www.gnu.org/software/coreutils/&quot;&gt;coreutils&lt;/a&gt; and one could replace it with &lt;a href=&quot;https://www.busybox.net/&quot;&gt;busybox&lt;/a&gt;.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Thank you to &lt;a href=&quot;https://github.com/jappeace&quot;&gt;jappeace&lt;/a&gt; for inspiring the pursuit.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h3 id=&quot;challenges--trivia&quot;&gt;Challenges &amp;amp; Trivia&lt;/h3&gt;
+
+&lt;p&gt;The rest of the post will document what it took to deliver this minimal shell. It was in fact not as trivial as it
+might have originally seemed.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;If you are only interested in having a minimal &lt;em&gt;nix-shell&lt;/em&gt; you can stop reading here 📖.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h4 id=&quot;tight-coupling-with-stdenv&quot;&gt;Tight coupling with stdenv&lt;/h4&gt;
+
+&lt;p&gt;In the pursuit of trying to remove &lt;a href=&quot;https://nixos.org/manual/nixpkgs/stable/#chap-stdenv&quot;&gt;stdenv&lt;/a&gt; was somewhat &lt;em&gt;annoying&lt;/em&gt;. I discovered that the &lt;em&gt;nix-shell&lt;/em&gt; implementation has some &lt;a href=&quot;https://github.com/NixOS/nix/blob/94ec9e47030c2a7280503d338f0dca7ad92811f5/src/nix-build/nix-build.cc#L494&quot;&gt;tight coupling&lt;/a&gt;(&lt;code class=&quot;highlighter-rouge&quot;&gt;source $stdenv/setup&lt;/code&gt;) with it by expecting a setup file provided by stdenv; this needed to be &lt;em&gt;hacked in&lt;/em&gt; 🐱‍💻.&lt;/p&gt;
+
+&lt;div class=&quot;language-c++ highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;n&quot;&gt;std&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;string&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;rc&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;fmt&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;R&quot;(_nix_shell_clean_tmpdir() { rm -rf %1%; }; )&quot;&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;s&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;keepTmp&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt;
+            &lt;span class=&quot;s&quot;&gt;&quot;trap _nix_shell_clean_tmpdir EXIT; &quot;&lt;/span&gt;
+            &lt;span class=&quot;s&quot;&gt;&quot;exitHooks+=(_nix_shell_clean_tmpdir); &quot;&lt;/span&gt;
+            &lt;span class=&quot;s&quot;&gt;&quot;failureHooks+=(_nix_shell_clean_tmpdir); &quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;:&lt;/span&gt;
+            &lt;span class=&quot;s&quot;&gt;&quot;_nix_shell_clean_tmpdir; &quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt;
+        &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;pure&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&quot;&quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&quot;[ -n &lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\&quot;&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;$PS1&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\&quot;&lt;/span&gt;&lt;span class=&quot;s&quot;&gt; ] &amp;amp;&amp;amp; [ -e ~/.bashrc ] &amp;amp;&amp;amp; source ~/.bashrc;&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;&quot;%2%&quot;&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;&quot;dontAddDisableDepTrack=1;&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\n&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;&lt;/span&gt;
+        &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;structuredAttrsRC&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;&quot;&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\n&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;[ -e $stdenv/setup ] &amp;amp;&amp;amp; source $stdenv/setup; &quot;&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;&quot;%3%&quot;&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;&quot;PATH=%4%:&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\&quot;&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;$PATH&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\&quot;&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;; &quot;&lt;/span&gt;
+        &lt;span class=&quot;s&quot;&gt;&quot;SHELL=%5%; &quot;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h4 id=&quot;how-is-bash-as-a-dependency-gone&quot;&gt;How is Bash as a dependency gone?&lt;/h4&gt;
+
+&lt;p&gt;Well since the purpose behind &lt;em&gt;nix-shell shell.nix&lt;/em&gt; is for a developer friendly environment (as opposed to debugging a failing deriviation), I have &lt;em&gt;mkShellMinimal&lt;/em&gt; rely on &lt;em&gt;/bin/sh&lt;/em&gt; which is &lt;em&gt;nearly&lt;/em&gt; required for POSIX compliance.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;In fact, even NixOS &lt;a href=&quot;https://github.com/NixOS/nixpkgs/blame/982fe76fa696743f7ddcfea68a54ed3c1a9ee4ec/nixos/modules/config/shells-environment.nix#L191-L198&quot;&gt;adds a symlink&lt;/a&gt; for /bin/sh.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;This works well for this case since the builder used for this shell is exceptionally simple.&lt;/p&gt;
+
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; &lt;span class=&quot;nv&quot;&gt;builder&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;writeScript&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;builder.sh&quot;&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    #!/bin/sh&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    echo&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    echo &quot;This derivation is not meant to be built, unless you want to capture the dependency closure.&quot;;&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    echo&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    export &amp;gt; $out&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h4 id=&quot;but-my-nix-shell-still-drops-me-in-bash-huh&quot;&gt;But my nix-shell still drops me in Bash? Huh?&lt;/h4&gt;
+
+&lt;p&gt;This is probably one of the most &lt;em&gt;bizarre&lt;/em&gt; aspects of &lt;em&gt;nix-shell&lt;/em&gt; and Nix; a system which tries to have reproducibility at it’s core.&lt;/p&gt;
+
+&lt;p&gt;&lt;em&gt;nix-shell&lt;/em&gt; by default, &lt;a href=&quot;https://github.com/NixOS/nix/blob/94ec9e47030c2a7280503d338f0dca7ad92811f5/src/nix-build/nix-build.cc#L365&quot;&gt;will start up Bash&lt;/a&gt; from whatever is referenced via your &lt;em&gt;nixpkgs&lt;/em&gt; channel. 😳&lt;/p&gt;
+
+&lt;div class=&quot;language-c++ highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;k&quot;&gt;auto&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;expr&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;state&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&amp;gt;&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;parseExprFromString&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;(import &amp;lt;nixpkgs&amp;gt; {}).bashInteractive&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;absPath&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;.&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;));&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;This means you could, &lt;em&gt;in theory&lt;/em&gt;, write a &lt;em&gt;shellHook&lt;/em&gt; in your mkShell that fails on another user’s machine since their &lt;em&gt;nixpkgs&lt;/em&gt; channel references a wildly different major version of Bash. 🤯&lt;/p&gt;
+
+&lt;p&gt;&lt;a href=&quot;https://github.com/NixOS/nix/issues/5098&quot;&gt;I would like to see&lt;/a&gt; &lt;em&gt;nix-shell&lt;/em&gt; use a value specified in the derivation itself, to identify the version of Bash to use. That would make it completely hermetic.&lt;/p&gt;
+
+&lt;h4 id=&quot;undocumented-requirements-to-have-nix-shell---pure-work&quot;&gt;Undocumented requirements to have &lt;code class=&quot;highlighter-rouge&quot;&gt;nix-shell --pure&lt;/code&gt; work&lt;/h4&gt;
+
+&lt;p&gt;I was struggling to get &lt;code class=&quot;highlighter-rouge&quot;&gt;nix-shell --pure&lt;/code&gt; to enforce purity and not persist my &lt;em&gt;$PATH&lt;/em&gt;. &lt;a href=&quot;https://github.com/NixOS/nix/issues/5092&quot;&gt;I would have expected&lt;/a&gt; this to a feature of the Nix CLI itself and not one of underlying derivation.&lt;/p&gt;
+
+&lt;p&gt;Turns out that is not the case.&lt;/p&gt;
+
+&lt;p&gt;&lt;em&gt;nix-shell&lt;/em&gt; requires that the &lt;em&gt;builder&lt;/em&gt; &lt;strong&gt;unconditionally&lt;/strong&gt; clears the &lt;em&gt;$PATH&lt;/em&gt; always at the start.&lt;/p&gt;</content><author><name></name></author><summary type="html">“The simplest things are often the truest.” - Richard Bach, 1936. Earlier I wrote about trying to get a minimal nix-shell. The goal and challenge of the post was about reducing the dependency closure size of the shell. I was asked what’s the point in trying to minimize the closure size ? We are using nix-shell in our CI infrastructure and every CI job hydrates it’s own /nix/store from scratch. Reducing the dependency closure size would mean faster CI runs. 🏎️ The post finished with a question, “Can we do better ?”, to which I answered “No, not at this time.”. I’d like to introduce mkShellMinimal that does better 🎊</summary></entry><entry><title type="html">A minimal nix-shell</title><link href="https://fzakaria.com/2021/08/02/a-minimal-nix-shell.html" rel="alternate" type="text/html" title="A minimal nix-shell" /><published>2021-08-02T10:35:00-07:00</published><updated>2021-08-02T10:35:00-07:00</updated><id>https://fzakaria.com/2021/08/02/a-minimal-nix-shell</id><content type="html" xml:base="https://fzakaria.com/2021/08/02/a-minimal-nix-shell.html">&lt;p&gt;We are currently using &lt;em&gt;nix-shell&lt;/em&gt; to create a reproducible environment for our developers and CI infrastructure. Can we minimize the dependency closure to make our CI jobs faster?&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;If you are familiar with &lt;em&gt;Nix&lt;/em&gt;, undoubtedly you have come across &lt;a href=&quot;https://nixos.org/manual/nix/unstable/command-ref/nix-shell.html&quot;&gt;nix-shell&lt;/a&gt;. Originally designed to help debug a failing deriviation by entering the user into a shell, it has quickly become a beloved way to create reproducible developer environments via &lt;a href=&quot;https://nixos.org/manual/nixpkgs/stable/#sec-pkgs-mkShell&quot;&gt;mkShell&lt;/a&gt;.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;mkShell is a special kind of derivation that is only useful when using it combined with nix-shell. It will in fact fail to instantiate when invoked with nix-build.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;&lt;em&gt;mkShell&lt;/em&gt; however comes with a predefined set of dependencies via the &lt;a href=&quot;https://nixos.org/manual/nixpkgs/stable/#chap-stdenv&quot;&gt;standard build environment (stdenv)&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Let’s look at an &lt;em&gt;empty mkShell&lt;/em&gt; and explore the transitive closure.&lt;/p&gt;
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;builtins&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;fetchTarball&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;nixos-unstable-2020-09-24&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;url&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;
+      &lt;span class=&quot;s2&quot;&gt;&quot;https://github.com/nixos/nixpkgs/archive/8ecc61c91a596df7d3293603a9c2384190c1b89a.tar.gz&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;sha256&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;0vhajylsmipjkm5v44n2h0pglcmpvk4mkyvxp7qfvkjdxw21dyml&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;})&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;mkShell&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;basic-shell&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;buildInputs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;shellHook&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;We can even visualize the dependency closure using &lt;a href=&quot;https://graphviz.org/&quot;&gt;graphviz&lt;/a&gt;.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;nix-store &lt;span class=&quot;nt&quot;&gt;--query&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--graph&lt;/span&gt; &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-A&lt;/span&gt; inputDerivation basic-shell.nix&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt; 
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/images/basic-shell-graph.svg&quot; alt=&quot;basic nix-shell&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;There is quite a lot there including GCC and we see the total closure size is &lt;strong&gt;~270MiB&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix path-info &lt;span class=&quot;nt&quot;&gt;--closure-size&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--human-readable&lt;/span&gt; &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-A&lt;/span&gt; inputDerivation basic-shell.nix&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt;
+
+/nix/store/zg33vr1apaq341c9bdfbhlwbp8l22qm6-basic-shell	 268.3M
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Let’s see how much better we can do with &lt;a href=&quot;https://github.com/NixOS/nixpkgs/commit/9b3091a94cad63ebd0bd7aafbcfed7c133ef899d&quot;&gt;mkShellNoCC&lt;/a&gt;.&lt;/p&gt;
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;builtins&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;fetchTarball&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;nixos-unstable-2020-09-24&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;url&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;
+      &lt;span class=&quot;s2&quot;&gt;&quot;https://github.com/nixos/nixpkgs/archive/8ecc61c91a596df7d3293603a9c2384190c1b89a.tar.gz&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;sha256&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;0vhajylsmipjkm5v44n2h0pglcmpvk4mkyvxp7qfvkjdxw21dyml&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;})&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;mkShellNoCC&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;shell-no-cc&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;buildInputs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;shellHook&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/images/shell-no-cc-graph.svg&quot; alt=&quot;nix-shell without compiler&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Looks like we are down to &lt;strong&gt;~53MiB&lt;/strong&gt;&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix path-info &lt;span class=&quot;nt&quot;&gt;--closure-size&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--human-readable&lt;/span&gt; &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-A&lt;/span&gt; inputDerivation shell-no-cc.nix&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;.&lt;/span&gt;
+/nix/store/7afg0p2kyc8qb5a0nv7mlvpf1mbpqkdx-shell-no-cc	  53.5M
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;🕵️ Can we do better?&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Thank you to &lt;a href=&quot;https://github.com/siraben&quot;&gt;siraben&lt;/a&gt; via Matrix to help share some of the following derivation.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Let’s strip everything in &lt;strong&gt;nix-shell&lt;/strong&gt; aside from &lt;em&gt;coreutils&lt;/em&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;builtins&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;fetchTarball&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;nixos-unstable-2020-09-24&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;url&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;
+      &lt;span class=&quot;s2&quot;&gt;&quot;https://github.com/nixos/nixpkgs/archive/8ecc61c91a596df7d3293603a9c2384190c1b89a.tar.gz&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;sha256&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;0vhajylsmipjkm5v44n2h0pglcmpvk4mkyvxp7qfvkjdxw21dyml&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;})&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;stdenvMinimal&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;stdenvNoCC&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;override&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;cc&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;preHook&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;allowedRequisites&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;null&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;initialPath&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;filter&lt;/span&gt;
+      &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;hasPrefix&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;coreutils&quot;&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;a&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+      &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;stdenvNoCC&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;initialPath&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;extraNativeBuildInputs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;minimalMkShell&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;mkShell&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;override&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;stdenvMinimal&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;minimalMkShell&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;minimal-shell&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;buildInputs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;shellHook&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/images/shell-minimal-graph.svg&quot; alt=&quot;nix-shell without compiler&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;💥 Looks like it’s down to &lt;strong&gt;34MiB&lt;/strong&gt;  💥&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix path-info &lt;span class=&quot;nt&quot;&gt;--closure-size&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--human-readable&lt;/span&gt; &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix-build &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-A&lt;/span&gt; inputDerivation minimal-shell.nix&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt;
+/nix/store/2msg7r8gd7ydwmr33a9nrrjnar7wywxh-minimal-shell	  34.9M
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Awesome, we’ve just reduced the closure-size by &lt;strong&gt;~7.7x&lt;/strong&gt; !&lt;/p&gt;
+
+&lt;p&gt;🧐 Most of that space is due to &lt;strong&gt;glibc&lt;/strong&gt; i8n &amp;amp; locales.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ &lt;span class=&quot;nb&quot;&gt;du&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-h&lt;/span&gt; /nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47 | &lt;span class=&quot;nb&quot;&gt;sort&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-rh&lt;/span&gt; | &lt;span class=&quot;nb&quot;&gt;head&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-n&lt;/span&gt; 10
+33M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47
+17M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/share/i18n
+17M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/share
+16M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/lib
+13M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/share/i18n/locales
+8.7M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/lib/gconv
+3.4M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/share/i18n/charmaps
+1.8M	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/lib/locale
+304K	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/share/locale
+128K	/nix/store/j5p0j1w27aqdzncpw73k95byvhh5prw2-glibc-2.33-47/libexec
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Can we do &lt;em&gt;even&lt;/em&gt; better?&lt;/p&gt;
+
+&lt;p&gt;Unfortunately &lt;strong&gt;not at this time&lt;/strong&gt;. Removing &lt;em&gt;coreutils&lt;/em&gt; from the closure, causes the &lt;a href=&quot;https://github.com/NixOS/nixpkgs/blob/c464dc811babfe316ed4ab7bbc12351122e69dd7/pkgs/stdenv/generic/builder.sh#L7&quot;&gt;basic builder&lt;/a&gt; to fail since it no longer can find &lt;em&gt;mkdir&lt;/em&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-shell minimal-shell.nix &lt;span class=&quot;nt&quot;&gt;--pure&lt;/span&gt;
+these derivations will be built:
+  /nix/store/4gw7ly8hicaw5895370ylmrdhz9l4y9d-stdenv-linux.drv
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/4gw7ly8hicaw5895370ylmrdhz9l4y9d-stdenv-linux.drv'&lt;/span&gt;...
+/nix/store/dsyj1sp3h8q2wwi8m6z548rvn3bmm3vc-builder.sh: line 7: &lt;span class=&quot;nb&quot;&gt;mkdir&lt;/span&gt;: &lt;span class=&quot;nb&quot;&gt;command &lt;/span&gt;not found
+builder &lt;span class=&quot;k&quot;&gt;for&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;'/nix/store/4gw7ly8hicaw5895370ylmrdhz9l4y9d-stdenv-linux.drv'&lt;/span&gt; failed with &lt;span class=&quot;nb&quot;&gt;exit &lt;/span&gt;code 127
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;</content><author><name></name></author><summary type="html">We are currently using nix-shell to create a reproducible environment for our developers and CI infrastructure. Can we minimize the dependency closure to make our CI jobs faster?</summary></entry><entry><title type="html">Eval the Nix</title><link href="https://fzakaria.com/2021/07/31/eval-the-nix.html" rel="alternate" type="text/html" title="Eval the Nix" /><published>2021-07-31T17:14:00-07:00</published><updated>2021-07-31T17:14:00-07:00</updated><id>https://fzakaria.com/2021/07/31/eval-the-nix</id><content type="html" xml:base="https://fzakaria.com/2021/07/31/eval-the-nix.html">&lt;p&gt;I’ll keep this post short and &lt;em&gt;sweet&lt;/em&gt;. I want to write a little blurb that I’ve been mostly enjoying using &lt;strong&gt;nix eval&lt;/strong&gt; to introspect.&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;&lt;strong&gt;Scenario 1&lt;/strong&gt;
+I wanted to set &lt;em&gt;JAVA_HOME&lt;/em&gt; to a particular JDK.&lt;/p&gt;
+
+&lt;p&gt;You can use &lt;code class=&quot;highlighter-rouge&quot;&gt;eval&lt;/code&gt; to determine the &lt;em&gt;JAVA_HOME. The &lt;strong&gt;gotcha&lt;/strong&gt; here however, is that the JDK may not necessarily be in your _/nix/home&lt;/em&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix &lt;span class=&quot;nb&quot;&gt;eval &lt;/span&gt;nixpkgs.jdk8.home &lt;span class=&quot;nt&quot;&gt;--raw&lt;/span&gt;
+/nix/store/0jfk27bplglsqh7m945pvayjwh2fy1m0-openjdk-8u272-b10/lib/openjdk
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;A more complete solution is the following.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ &lt;span class=&quot;nb&quot;&gt;export &lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;JAVA_HOME&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix build nixpkgs.jdk8 &lt;span class=&quot;o&quot;&gt;&amp;amp;&amp;amp;&lt;/span&gt; nix &lt;span class=&quot;nb&quot;&gt;eval &lt;/span&gt;nixpkgs.jdk8.home &lt;span class=&quot;nt&quot;&gt;--raw&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;strong&gt;Scenario 2&lt;/strong&gt; I wanted to discover the calculated &lt;em&gt;/nix/store&lt;/em&gt; path for a particular derivation.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix &lt;span class=&quot;nb&quot;&gt;eval &lt;/span&gt;nixpkgs.hello.outPath &lt;span class=&quot;nt&quot;&gt;--raw&lt;/span&gt;
+/nix/store/jmmw0d3nmklwafcwylvrjb9v69wrbcxf-hello-2.10
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;💡 You can also do something similar to find out the derivation path.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix &lt;span class=&quot;nb&quot;&gt;eval &lt;/span&gt;nixpkgs.hello.drvPath &lt;span class=&quot;nt&quot;&gt;--raw&lt;/span&gt;
+/nix/store/wqnx5cgcabxkfp771fmjr1nw7mjr9zlm-hello-2.10.drv
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;strong&gt;Scenario 3&lt;/strong&gt; I want a quick one-liner for what I can do with &lt;code class=&quot;highlighter-rouge&quot;&gt;nix repl&lt;/code&gt;.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix &lt;span class=&quot;nb&quot;&gt;eval&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;'(builtins.attrNames (import &amp;lt;nixpkgs&amp;gt;{}).hello)'&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--json&lt;/span&gt; | jq
+&lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;
+  &lt;span class=&quot;s2&quot;&gt;&quot;__ignoreNulls&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;all&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;args&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;buildInputs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;builder&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;configureFlags&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsBuildBuild&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsBuildBuildPropagated&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsBuildTarget&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsBuildTargetPropagated&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsHostHost&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsHostHostPropagated&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsTargetTarget&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;depsTargetTargetPropagated&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;doCheck&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;doInstallCheck&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;drvAttrs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;drvPath&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;inputDerivation&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;meta&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;name&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;nativeBuildInputs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;out&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;outPath&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;outputName&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;outputUnspecified&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;outputs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;override&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;overrideAttrs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;overrideDerivation&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;passthru&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;patches&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;pname&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;propagatedBuildInputs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;propagatedNativeBuildInputs&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;src&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;stdenv&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;strictDeps&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;system&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;tests&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;type&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;userHook&quot;&lt;/span&gt;,
+  &lt;span class=&quot;s2&quot;&gt;&quot;version&quot;&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;]&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;⚠️ I do find however &lt;strong&gt;annoying&lt;/strong&gt; differences between &lt;code class=&quot;highlighter-rouge&quot;&gt;nix repl&lt;/code&gt; and &lt;code class=&quot;highlighter-rouge&quot;&gt;nix eval&lt;/code&gt; that I’m not clear on.&lt;/p&gt;
+
+&lt;p&gt;For instance the following works on &lt;code class=&quot;highlighter-rouge&quot;&gt;nix repl&lt;/code&gt; but fails on &lt;code class=&quot;highlighter-rouge&quot;&gt;nix eval&lt;/code&gt;&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix repl
+Welcome to Nix version 2.3.12. Type :? &lt;span class=&quot;k&quot;&gt;for &lt;/span&gt;help.
+
+nix-repl&amp;gt; :l &amp;lt;nixpkgs&amp;gt;
+Added 14373 variables.
+
+nix-repl&amp;gt; hello
+«derivation /nix/store/wqnx5cgcabxkfp771fmjr1nw7mjr9zlm-hello-2.10.drv»
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix &lt;span class=&quot;nb&quot;&gt;eval &lt;/span&gt;nixpkgs#hello
+error: anonymous &lt;span class=&quot;k&quot;&gt;function &lt;/span&gt;at /nix/store/h7b0frzjk6ylyqq471m667yd9bl9n6fm-source/pkgs/build-support/fetchurl/boot.nix:5:1 called with unexpected argument &lt;span class=&quot;s1&quot;&gt;'meta'&lt;/span&gt;
+
+       at /nix/store/h7b0frzjk6ylyqq471m667yd9bl9n6fm-source/pkgs/build-support/fetchzip/default.nix:18:2:
+
+           17|
+           18| &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;fetchurl &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;let&lt;/span&gt;
+             |  ^
+           19|   &lt;span class=&quot;nb&quot;&gt;basename&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; baseNameOf &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;k&quot;&gt;if &lt;/span&gt;url &lt;span class=&quot;o&quot;&gt;!=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;&quot;&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;then &lt;/span&gt;url &lt;span class=&quot;k&quot;&gt;else &lt;/span&gt;builtins.head urls&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;use &lt;span class=&quot;s1&quot;&gt;'--show-trace'&lt;/span&gt; to show detailed location information&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;If you happen to know why, answer &lt;a href=&quot;https://discourse.nixos.org/t/nix-eval-has-terrible-messages-how-to-improve/14339&quot;&gt;this message on discourse&lt;/a&gt; or &lt;a href=&quot;https://twitter.com/fmzakari&quot;&gt;tweet me&lt;/a&gt;.&lt;/p&gt;</content><author><name></name></author><summary type="html">I’ll keep this post short and sweet. I want to write a little blurb that I’ve been mostly enjoying using nix eval to introspect.</summary></entry><entry><title type="html">Java, Nix &amp;amp; Reproducibility</title><link href="https://fzakaria.com/2021/06/27/java-nix-reproducibility.html" rel="alternate" type="text/html" title="Java, Nix &amp; Reproducibility" /><published>2021-06-27T19:01:00-07:00</published><updated>2021-06-27T19:01:00-07:00</updated><id>https://fzakaria.com/2021/06/27/java-nix-reproducibility</id><content type="html" xml:base="https://fzakaria.com/2021/06/27/java-nix-reproducibility.html">&lt;p&gt;I’ve written &lt;em&gt;a lot&lt;/em&gt; about NixOS; specifically about some of the work I’ve done to improve the Java ecosystem.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;In fact, I’ve upstreamed my notes into the &lt;a href=&quot;https://nixos.org/manual/nixpkgs/unstable/#maven&quot;&gt;Java Maven Nixpkgs documentation&lt;/a&gt;.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;🎉 Recently, the minimal ISO for NixOS &lt;a href=&quot;https://web.archive.org/web/20210620180034/https://r13y.com/&quot;&gt;has become reproducible (r13y)&lt;/a&gt;. 🎉&lt;/p&gt;
+
+&lt;p&gt;The ability to produce binary reproducible artifacts is a powerful primitive. What does it take for the JVM ecosystem to adopt reproducible builds within the Nix environment?&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;For rationale on the &lt;em&gt;why&lt;/em&gt;, please see &lt;a href=&quot;https://reproducible-builds.org/&quot;&gt;https://reproducible-builds.org/&lt;/a&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;!--more--&gt;
+
+&lt;p&gt;Traditionally, Nix’s primary model for addressing artifacts is via the &lt;em&gt;input-addressed store&lt;/em&gt; or &lt;em&gt;extensional model&lt;/em&gt;; where the name of the package  (cryptographic hash) is derived from it’s dependencies, own package description and sources. Put simply, &lt;strong&gt;the &lt;em&gt;/nix/store/&lt;/em&gt; path-entry is deterministic irrespective of whether the contents are deterministic&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;This model is pragmatic since in practice, many binary differences are irrelevant (timestamps) however it leads to very pessimistic rebuilds of the source graph.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Consider the example where a &lt;em&gt;comment&lt;/em&gt; is added to a source dependency deep in the dependency graph; this would cause the whole graph to rebuild! If we knew the binary output was the same even with the comment added, we can avoid rebuilding all upstream dependencies.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Where does Java/Maven fit in!?
+Let’s start with a very simple application.&lt;/p&gt;
+
+&lt;div class=&quot;language-xml highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c&quot;&gt;&amp;lt;!-- pom.xml --&amp;gt;&lt;/span&gt;
+&lt;span class=&quot;cp&quot;&gt;&amp;lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&amp;gt;&lt;/span&gt;
+&lt;span class=&quot;nt&quot;&gt;&amp;lt;project&lt;/span&gt; &lt;span class=&quot;na&quot;&gt;xmlns=&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;http://maven.apache.org/POM/4.0.0&quot;&lt;/span&gt; &lt;span class=&quot;na&quot;&gt;xmlns:xsi=&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;http://www.w3.org/2001/XMLSchema-instance&quot;&lt;/span&gt;
+        &lt;span class=&quot;na&quot;&gt;xsi:schemaLocation=&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd&quot;&lt;/span&gt;&lt;span class=&quot;nt&quot;&gt;&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;modelVersion&amp;gt;&lt;/span&gt;4.0.0&lt;span class=&quot;nt&quot;&gt;&amp;lt;/modelVersion&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;groupId&amp;gt;&lt;/span&gt;org.nixos&lt;span class=&quot;nt&quot;&gt;&amp;lt;/groupId&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;artifactId&amp;gt;&lt;/span&gt;nixos-java-maven-r8&lt;span class=&quot;nt&quot;&gt;&amp;lt;/artifactId&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;version&amp;gt;&lt;/span&gt;1.0&lt;span class=&quot;nt&quot;&gt;&amp;lt;/version&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;packaging&amp;gt;&lt;/span&gt;jar&lt;span class=&quot;nt&quot;&gt;&amp;lt;/packaging&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;name&amp;gt;&lt;/span&gt;NixOS Java Maven Reproducibility&lt;span class=&quot;nt&quot;&gt;&amp;lt;/name&amp;gt;&lt;/span&gt;
+
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;properties&amp;gt;&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;&amp;lt;maven.compiler.target&amp;gt;&lt;/span&gt;1.8&lt;span class=&quot;nt&quot;&gt;&amp;lt;/maven.compiler.target&amp;gt;&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;&amp;lt;maven.compiler.source&amp;gt;&lt;/span&gt;1.8&lt;span class=&quot;nt&quot;&gt;&amp;lt;/maven.compiler.source&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;/properties&amp;gt;&lt;/span&gt;
+
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;dependencies&amp;gt;&lt;/span&gt;
+
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;/dependencies&amp;gt;&lt;/span&gt;
+
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;build&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;plugins&amp;gt;&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;&amp;lt;plugin&amp;gt;&lt;/span&gt;
+        &lt;span class=&quot;nt&quot;&gt;&amp;lt;artifactId&amp;gt;&lt;/span&gt;maven-jar-plugin&lt;span class=&quot;nt&quot;&gt;&amp;lt;/artifactId&amp;gt;&lt;/span&gt;
+        &lt;span class=&quot;nt&quot;&gt;&amp;lt;version&amp;gt;&lt;/span&gt;3.2.0&lt;span class=&quot;nt&quot;&gt;&amp;lt;/version&amp;gt;&lt;/span&gt;
+        &lt;span class=&quot;nt&quot;&gt;&amp;lt;configuration&amp;gt;&lt;/span&gt;
+            &lt;span class=&quot;nt&quot;&gt;&amp;lt;archive&amp;gt;&lt;/span&gt;
+                &lt;span class=&quot;nt&quot;&gt;&amp;lt;manifest&amp;gt;&lt;/span&gt;
+                    &lt;span class=&quot;nt&quot;&gt;&amp;lt;mainClass&amp;gt;&lt;/span&gt;Main&lt;span class=&quot;nt&quot;&gt;&amp;lt;/mainClass&amp;gt;&lt;/span&gt;
+                &lt;span class=&quot;nt&quot;&gt;&amp;lt;/manifest&amp;gt;&lt;/span&gt;
+            &lt;span class=&quot;nt&quot;&gt;&amp;lt;/archive&amp;gt;&lt;/span&gt;
+        &lt;span class=&quot;nt&quot;&gt;&amp;lt;/configuration&amp;gt;&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;&amp;lt;/plugin&amp;gt;&lt;/span&gt;
+  &lt;span class=&quot;nt&quot;&gt;&amp;lt;/plugins&amp;gt;&lt;/span&gt;
+&lt;span class=&quot;nt&quot;&gt;&amp;lt;/build&amp;gt;&lt;/span&gt;
+&lt;span class=&quot;nt&quot;&gt;&amp;lt;/project&amp;gt;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;div class=&quot;language-java highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c1&quot;&gt;// src/main/java/Main.java&lt;/span&gt;
+&lt;span class=&quot;kd&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;Main&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;{&lt;/span&gt;
+   &lt;span class=&quot;kd&quot;&gt;public&lt;/span&gt; &lt;span class=&quot;kd&quot;&gt;static&lt;/span&gt; &lt;span class=&quot;kt&quot;&gt;void&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;main&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;String&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;[]&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;args&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;){&lt;/span&gt;
+     &lt;span class=&quot;nc&quot;&gt;System&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;out&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;na&quot;&gt;println&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;Hello NixOS!&quot;&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;);&lt;/span&gt;
+   &lt;span class=&quot;o&quot;&gt;}&lt;/span&gt;
+
+&lt;span class=&quot;o&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;},&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;maven&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;maven&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;jre&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;jre&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;makeWrapper&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;makeWrapper&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;}:&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;mkDerivation&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;rec&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;pname&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;nixos-java-maven-r8&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;version&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;1.0&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;__noChroot&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kc&quot;&gt;true&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;src&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;cleanSourceWith&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;filter&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;cleanSourceFilter&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;src&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;cleanSourceWith&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+      &lt;span class=&quot;nv&quot;&gt;filter&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;path&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;type&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;:&lt;/span&gt;
+        &lt;span class=&quot;o&quot;&gt;!&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;lib&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;pathIsDirectory&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;path&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;baseNameOf&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;kr&quot;&gt;toString&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;path&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt;
+          &lt;span class=&quot;o&quot;&gt;==&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;target&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt;
+      &lt;span class=&quot;nv&quot;&gt;src&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;sx&quot;&gt;./.&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;buildInputs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;[&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;maven&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;makeWrapper&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;];&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;buildPhase&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    mvn package;&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;installPhase&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    # create the bin directory&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    mkdir -p $out/bin&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    # copy out the JAR&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    # Maven already setup the classpath to use m2 repository layout&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    # with the prefix of lib/&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    cp target/&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;pname&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;-&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;version&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;.jar $out/&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    # create a wrapper that will automatically call the jar&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    makeWrapper &lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;jre&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;/bin/java $out/bin/&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;pname&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt; \&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;          --add-flags &quot;-jar $out/&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;pname&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;-&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;version&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;.jar&quot;&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Nothing surprising here if you’ve read the Maven Nixpkgs documentation. The one &lt;em&gt;simplification&lt;/em&gt; is the use of &lt;code class=&quot;highlighter-rouge&quot;&gt;__noChroot&lt;/code&gt; which disables sandboxing.
+This is to make the use of &lt;em&gt;Maven&lt;/em&gt; a bit simpler for education purposes.&lt;/p&gt;
+
+&lt;p&gt;Let’s build!&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-build build.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; sandbox relaxed &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt;
+... bunch of output omitted ...
+/nix/store/g1bgxhr84ldag0hyshlz3r7aagq551f8-nixos-java-maven-r8-1.0
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;We can then ask Nix to validate that our derivation is &lt;em&gt;binary reproducible&lt;/em&gt;.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-build build.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; sandbox relaxed &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--check&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--keep-failed&lt;/span&gt;
+... bunch of output omitted ...
+derivation &lt;span class=&quot;s1&quot;&gt;'/nix/store/7hfkwwdb5y4llbgykb3dgnb2hy5xwww4-nixos-java-maven-r8-1.0.drv'&lt;/span&gt; may not be deterministic: output &lt;span class=&quot;s1&quot;&gt;'/nix/store/g1bgxhr84ldag0hyshlz3r7aagq551f8-nixos-java-maven-r8-1.0'&lt;/span&gt; differs from &lt;span class=&quot;s1&quot;&gt;'/nix/store/g1bgxhr84ldag0hyshlz3r7aagq551f8-nixos-java-maven-r8-1.0.check'&lt;/span&gt;
+note: keeping build directory &lt;span class=&quot;s1&quot;&gt;'/tmp/nix-build-nixos-java-maven-r8-1.0.drv-4'&lt;/span&gt;
+error: build of &lt;span class=&quot;s1&quot;&gt;'/nix/store/7hfkwwdb5y4llbgykb3dgnb2hy5xwww4-nixos-java-maven-r8-1.0.drv'&lt;/span&gt; failed
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;😮 We’ve hit an error identifying that our build &lt;em&gt;may not be deterministic&lt;/em&gt;. Let’s use &lt;a href=&quot;https://diffoscope.org/&quot;&gt;diffoscope&lt;/a&gt; to dig into why.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/images/maven-diff-r13y.png&quot; alt=&quot;VPN graphic&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Looks like there is a difference due to timestamps.&lt;/p&gt;
+
+&lt;p&gt;The JAR archive format is based on the ZIP archive format, which is &lt;a href=&quot;https://wiki.debian.org/ReproducibleBuilds/TimestampsInZip&quot;&gt;known not to be binary reproducible&lt;/a&gt;.
+The ZIP archive format record mtimes of the packed files, which will prevent reproducibility.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;This is in fact why Nix has it’s own archive format, &lt;em&gt;Nix Archive&lt;/em&gt; (NAR), that addresses typical non-determinism issues with archive formats.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;Luckily, Maven itself &lt;a href=&quot;https://maven.apache.org/guides/mini/guide-reproducible-builds.html&quot;&gt;has the ability&lt;/a&gt; to force-set these timestamps and enable reproducible builds.&lt;/p&gt;
+&lt;div class=&quot;language-xml highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c&quot;&gt;&amp;lt;!-- We add this to our properties, set it to any time you see fit --&amp;gt;&lt;/span&gt;
+&lt;span class=&quot;nt&quot;&gt;&amp;lt;project.build.outputTimestamp&amp;gt;&lt;/span&gt;1&lt;span class=&quot;nt&quot;&gt;&amp;lt;/project.build.outputTimestamp&amp;gt;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;If we try the build again, we are now reproducible.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c&quot;&gt;# let's repeat the build three times&lt;/span&gt;
+❯ nix-build build.nix &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; sandbox relaxed &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; repeat 3 &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; enforce-determinism &lt;span class=&quot;nb&quot;&gt;true
+&lt;/span&gt;building &lt;span class=&quot;s1&quot;&gt;'/nix/store/yvvia00l1vls1qkgypikvjivn2ash498-nixos-java-maven-r8-1.0.drv'&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;round 1/4&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;...
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/yvvia00l1vls1qkgypikvjivn2ash498-nixos-java-maven-r8-1.0.drv'&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;round 2/4&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;...
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/yvvia00l1vls1qkgypikvjivn2ash498-nixos-java-maven-r8-1.0.drv'&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;round 3/4&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;...
+building &lt;span class=&quot;s1&quot;&gt;'/nix/store/yvvia00l1vls1qkgypikvjivn2ash498-nixos-java-maven-r8-1.0.drv'&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;round 4/4&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;...
+/nix/store/ws9flbiil6226lx5ifb1yfd3gijcz27j-nixos-java-maven-r8-1.0
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;This may all seem very &lt;em&gt;pedantic&lt;/em&gt;, however I ran into the crux of having JARs non-deterministic when building out &lt;a href=&quot;https://github.com/fzakaria/mvn2nix&quot;&gt;mvn2nix&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Gradle has an interesting call out in &lt;a href=&quot;https://docs.gradle.org/current/userguide/dependency_verification.html#sec:trusting-several-checksums&quot;&gt;its documentation&lt;/a&gt;, for the problem I encountered.&lt;/p&gt;
+&lt;blockquote&gt;
+  &lt;p&gt;It’s quite common to have different checksums for the same artifact in the wild. How is that possible? Despite progress, it’s often the case that developers publish, for example, to Maven Central and another repository separately, using different builds.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;That means that &lt;strong&gt;you cannot guarantee&lt;/strong&gt; that a JAR published on one Maven artifactory, will give you the same binary content from another, &lt;strong&gt;for the exact same version&lt;/strong&gt;.&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://media.giphy.com/media/LpLd2NGvpaiys/giphy.gif&quot; alt=&quot;mind-blown&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Reproducible builds provide a lot of benefit. While making a build deterministic is not always feasible, and a touch of pragmatism is useful, we should provide tooling to make it simpler when possible.&lt;/p&gt;
+
+&lt;p&gt;&lt;em&gt;Better yet, have the default be determinism.&lt;/em&gt;&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Should we track in Maven Central which packages are reproducible?&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h2 id=&quot;alternative&quot;&gt;Alternative&lt;/h2&gt;
+
+&lt;p&gt;We could also make the JAR (ZIP) archive deterministic using Debian’s &lt;a href=&quot;https://tracker.debian.org/pkg/strip-nondeterminism&quot;&gt;strip-nondeterminism&lt;/a&gt; script.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;🧐 Should this script be included by default in the &lt;em&gt;fixupPhase&lt;/em&gt; ?&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;nv&quot;&gt;postFixup&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  # Removing the nondeterminism&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  &lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;strip-nondeterminism&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;/bin/strip-nondeterminism $out/&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;pname&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;-&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;${&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;version&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;.jar&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;</content><author><name></name></author><summary type="html">I’ve written a lot about NixOS; specifically about some of the work I’ve done to improve the Java ecosystem. In fact, I’ve upstreamed my notes into the Java Maven Nixpkgs documentation. 🎉 Recently, the minimal ISO for NixOS has become reproducible (r13y). 🎉 The ability to produce binary reproducible artifacts is a powerful primitive. What does it take for the JVM ecosystem to adopt reproducible builds within the Nix environment? For rationale on the why, please see https://reproducible-builds.org/</summary></entry><entry><title type="html">setting up a Nix Google Cloud Storage (GCS) binary cache</title><link href="https://fzakaria.com/2021/06/22/setting-up-a-nix-google-cloud-storage-gcs-binary-cache.html" rel="alternate" type="text/html" title="setting up a Nix Google Cloud Storage (GCS) binary cache" /><published>2021-06-22T08:26:00-07:00</published><updated>2021-06-22T08:26:00-07:00</updated><id>https://fzakaria.com/2021/06/22/setting-up-a-nix-google-cloud-storage-gcs-binary-cache</id><content type="html" xml:base="https://fzakaria.com/2021/06/22/setting-up-a-nix-google-cloud-storage-gcs-binary-cache.html">&lt;p&gt;A previous post documented how to &lt;a href=&quot;/2020/07/15/setting-up-a-nix-s3-binary-cache.html&quot;&gt;setup a binary cache directly on S3&lt;/a&gt;.
+Many however are tied to a different public IaaS offering and may not be able to leverage the native S3 integration Nix offers.
+Luckily for those using GCP, Google’s blob storage equivalent &lt;a href=&quot;https://cloud.google.com/storage&quot;&gt;Google Cloud Storage (GCS)&lt;/a&gt; has &lt;a href=&quot;https://cloud.google.com/storage/docs/interoperability&quot;&gt;interoperability&lt;/a&gt; with the S3 API.&lt;/p&gt;
+
+&lt;p&gt;This will allow us to host our binary cache on GCS while still using the native S3 integration in Nix.
+Following this guide will allow Nix to leverage GCS without having to use a proxy such as &lt;a href=&quot;https://github.com/tweag/nix-store-gcs-proxy&quot;&gt;nix-store-gcs-proxy&lt;/a&gt;.&lt;/p&gt;
+
+&lt;!--more--&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;The following guide will assume &lt;em&gt;some familiarity&lt;/em&gt; with the GCP ecosystem.
+You may want to follow best practices for reducing IAM roles and service account management.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;Let’s create a bucket for us to store the Nix binary artifacts.
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ❯ gsutil mb gs://nix-cache-testing
+ Creating gs://nix-cache-testing/...
+ &lt;span class=&quot;c&quot;&gt;# Validate it exists&lt;/span&gt;
+ ❯ gsutil &lt;span class=&quot;nb&quot;&gt;du&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-s&lt;/span&gt; gs://nix-cache-testing
+ 0            gs://nix-cache-testing
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Create a &lt;em&gt;service account&lt;/em&gt;.
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ❯ gcloud iam service-accounts create nix-cache-testing &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ &lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt;       &lt;span class=&quot;nt&quot;&gt;--description&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;Service account for Nix GCS cache&quot;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+ &lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt;       &lt;span class=&quot;nt&quot;&gt;--display-name&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;Nix GCS Service Account&quot;&lt;/span&gt;
+ Created service account &lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;nix-cache-testing].
+ &lt;span class=&quot;c&quot;&gt;# Validate it exists&lt;/span&gt;
+ ❯ gcloud iam service-accounts list
+ DISPLAY NAME                            EMAIL                                                                     DISABLED
+ Nix GCS Service Account                 nix-cache-testing@my-project.google.com.iam.gserviceaccount.com  False
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Create an &lt;em&gt;hmac&lt;/em&gt; for use with S3 API.
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ❯ gsutil hmac create  nix-cache-testing@my-project.iam.gserviceaccount.com
+ Access ID:   GOOGTS7C7FUP3AIRVJTE2BCDKINBTES3HC2GY5CBFJDCQ2SYHV6A6XXVTJFSA
+ Secret:      &amp;lt;SCRUBBED OUT FOR SECURITY&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Attach an appropriate IAM role to the service account.
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ❯ gcloud projects add-iam-policy-binding my-project &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+     &lt;span class=&quot;nt&quot;&gt;--member&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;serviceAccount:nix-cache-testing@my-project.iam.gserviceaccount.com&quot;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+     &lt;span class=&quot;nt&quot;&gt;--role&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;roles/storage.admin&quot;&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--condition&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;None
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;Set the credentials anywhere the &lt;a href=&quot;https://docs.aws.amazon.com/cli/latest/topic/config-vars.html#credentials&quot;&gt;that works&lt;/a&gt; for the AWS CLI.
+I’ve chosen to do it in the &lt;code class=&quot;highlighter-rouge&quot;&gt;~/.aws/credentials&lt;/code&gt; within a profile named &lt;em&gt;gcp&lt;/em&gt;.
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ❯ &lt;span class=&quot;nb&quot;&gt;cat&lt;/span&gt; ~/.aws/credentials
+ &lt;span class=&quot;o&quot;&gt;[&lt;/span&gt;gcp]
+ aws_access_key_id &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; GOOGTS7C7FUP3AIRVJTE2BCDKINBTES3HC2GY5CBFJDCQ2SYHV6A6XXVTJFSA
+ aws_secret_access_key &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &amp;lt;SCRUBBED OUT FOR SECURITY&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;Try the &lt;em&gt;aws&lt;/em&gt; CLI and validate everything works.&lt;/p&gt;
+
+    &lt;blockquote&gt;
+      &lt;p&gt;You can avoid setting the endpoint-url if you use the &lt;a href=&quot;https://github.com/wbingli/awscli-plugin-endpoint&quot;&gt;awscli-plugin-endpoint&lt;/a&gt;.&lt;/p&gt;
+    &lt;/blockquote&gt;
+
+    &lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt; ❯ aws s3 &lt;span class=&quot;nb&quot;&gt;ls&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--profile&lt;/span&gt; gcp &lt;span class=&quot;nt&quot;&gt;--endpoint-url&lt;/span&gt; https://storage.googleapis.com
+ 2021-06-22 09:04:24 nix-cache-testing
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;    &lt;/div&gt;
+  &lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;🙌 Woohoo! We’ve just setup basic interoperability for GCS behaving like the S3 API.
+Let’s see if the interopt is good enough to fool the API Nix relies on.&lt;/p&gt;
+
+&lt;p&gt;Let’s create a really basic derivation (&lt;em&gt;lolhello.nix&lt;/em&gt;) we will be using to test.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;For brevity, I’m not pinning my &lt;em&gt;nixpkgs&lt;/em&gt; channel, but that practice is recommended.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;},&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;fetchurl&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;?&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;fetchurl&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;}:&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;stdenv&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;mkDerivation&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+  &lt;span class=&quot;nv&quot;&gt;name&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;lolhello&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;src&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;fetchurl&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;url&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;mirror://gnu/hello/hello-2.3.tar.bz2&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+    &lt;span class=&quot;nv&quot;&gt;sha256&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;0c7vijq8y68bpr7g6dh1gny0bff8qq81vnp4ch8pjzvg56wb3js1&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+  &lt;span class=&quot;p&quot;&gt;};&lt;/span&gt;
+
+  &lt;span class=&quot;nv&quot;&gt;patchPhase&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;    sed -i 's/Hello, world!/hello, Nix!/g' src/hello.c&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;  ''&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt;
+&lt;span class=&quot;p&quot;&gt;}&lt;/span&gt;
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Let’s build it. 🏗️&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-build lolhello.nix &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt;
+/nix/store/czf8l5nlp2kaag96hb42qvqd85glr8f8-lolhello
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Now let’s try to upload it to our GCS bucket via the S3 integration in Nix.&lt;/p&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix copy &lt;span class=&quot;si&quot;&gt;$(&lt;/span&gt;nix-build lolhello.nix &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;)&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;--to&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;s3://nix-cache-testing?endpoint=https://storage.googleapis.com&amp;amp;profile=gcp&quot;&lt;/span&gt;
+
+&lt;span class=&quot;c&quot;&gt;# Check it's been uploaded&lt;/span&gt;
+❯ aws s3 &lt;span class=&quot;nb&quot;&gt;ls &lt;/span&gt;nix-cache-testing &lt;span class=&quot;nt&quot;&gt;--profile&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;=&lt;/span&gt;gcp &lt;span class=&quot;nt&quot;&gt;--endpoint-url&lt;/span&gt; https://storage.googleapis.com
+                           PRE nar/
+2021-06-22 12:09:42        476 czf8l5nlp2kaag96hb42qvqd85glr8f8.narinfo
+
+&lt;span class=&quot;c&quot;&gt;# Check it using the gsutil also&lt;/span&gt;
+❯ gsutil &lt;span class=&quot;nb&quot;&gt;ls &lt;/span&gt;gs://nix-cache-testing
+gs://nix-cache-testing/czf8l5nlp2kaag96hb42qvqd85glr8f8.narinfo
+gs://nix-cache-testing/nar/
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Now let’s delete it from our system.&lt;/p&gt;
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-store &lt;span class=&quot;nt&quot;&gt;--delete&lt;/span&gt; /nix/store/czf8l5nlp2kaag96hb42qvqd85glr8f8-lolhello
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Now let’s try to build it, using our substituter.
+We will also disable building locally to verify everything is working correctly.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;I disabled verifying the signatures for now for simplicity of the demo. Please see my
+&lt;a href=&quot;/2020/07/15/setting-up-a-nix-s3-binary-cache.html&quot;&gt;previous post&lt;/a&gt; on how to add signatures.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;div class=&quot;language-bash highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;❯ nix-build lolhello.nix &lt;span class=&quot;nt&quot;&gt;--no-out-link&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;--builders&lt;/span&gt; &lt;span class=&quot;s1&quot;&gt;''&lt;/span&gt; &lt;span class=&quot;nt&quot;&gt;-j0&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; substituters &lt;span class=&quot;s2&quot;&gt;&quot;s3://nix-cache-testing?endpoint=https://storage.googleapis.com&amp;amp;profile=gcp&quot;&lt;/span&gt; &lt;span class=&quot;se&quot;&gt;\&lt;/span&gt;
+    &lt;span class=&quot;nt&quot;&gt;--option&lt;/span&gt; require-sigs &lt;span class=&quot;nb&quot;&gt;false
+&lt;/span&gt;these paths will be fetched &lt;span class=&quot;o&quot;&gt;(&lt;/span&gt;0.03 MiB download, 0.18 MiB unpacked&lt;span class=&quot;o&quot;&gt;)&lt;/span&gt;:
+  /nix/store/czf8l5nlp2kaag96hb42qvqd85glr8f8-lolhello
+copying path &lt;span class=&quot;s1&quot;&gt;'/nix/store/czf8l5nlp2kaag96hb42qvqd85glr8f8-lolhello'&lt;/span&gt; from &lt;span class=&quot;s1&quot;&gt;'s3://nix-cache-testing'&lt;/span&gt;...
+/nix/store/czf8l5nlp2kaag96hb42qvqd85glr8f8-lolhello
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;🎉 Nice! That was surprisingly straightforward to setup GCS as our Nix binary cache pretending to be S3.&lt;/p&gt;
+
+&lt;p&gt;📣 Shoutout to my colleague &lt;a href=&quot;https://www.linkedin.com/in/micah-catlin-0718991&quot;&gt;Micah Catlin&lt;/a&gt; who did a proof of concept originally and
+introduced me to the interoperability support of GCS.&lt;/p&gt;
+
+&lt;h3 id=&quot;addendum&quot;&gt;Addendum&lt;/h3&gt;
+
+&lt;p&gt;Originally I spent quite a while trying the demo above with a different demo derivation that used a &lt;em&gt;trivial builder&lt;/em&gt;.&lt;/p&gt;
+&lt;div class=&quot;language-nix highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kd&quot;&gt;let&lt;/span&gt; &lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kr&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;nixpkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;&amp;gt;&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;{};&lt;/span&gt;
+&lt;span class=&quot;kn&quot;&gt;in&lt;/span&gt;
+&lt;span class=&quot;nv&quot;&gt;pkgs&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nv&quot;&gt;writeShellScriptBin&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;ping&quot;&lt;/span&gt;
+&lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;echo &quot;pong&quot;&lt;/span&gt;&lt;span class=&quot;err&quot;&gt;
+&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;''&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;I could not figure out why it was not substituting from my binary cache though! 😫
+Turns out that some of the &lt;a href=&quot;https://github.com/NixOS/nixpkgs/blob/d26902aef932e80eb772026433af13ce662e7872/pkgs/build-support/trivial-builders.nix#L16&quot;&gt;trivial builders&lt;/a&gt; disable realization from a store and prefer locally building.&lt;/p&gt;
+
+&lt;p&gt;&lt;em&gt;That was quite a bit of wasted time investigating…&lt;/em&gt;&lt;/p&gt;</content><author><name></name></author><summary type="html">A previous post documented how to setup a binary cache directly on S3. Many however are tied to a different public IaaS offering and may not be able to leverage the native S3 integration Nix offers. Luckily for those using GCP, Google’s blob storage equivalent Google Cloud Storage (GCS) has interoperability with the S3 API. This will allow us to host our binary cache on GCS while still using the native S3 integration in Nix. Following this guide will allow Nix to leverage GCS without having to use a proxy such as nix-store-gcs-proxy.</summary></entry><entry><title type="html">JRuby and Sorbet</title><link href="https://fzakaria.com/2021/03/13/jruby-and-sorbet.html" rel="alternate" type="text/html" title="JRuby and Sorbet" /><published>2021-03-13T10:11:00-08:00</published><updated>2021-03-13T10:11:00-08:00</updated><id>https://fzakaria.com/2021/03/13/jruby-and-sorbet</id><content type="html" xml:base="https://fzakaria.com/2021/03/13/jruby-and-sorbet.html">&lt;p&gt;A &lt;a href=&quot;https://twitter.com/jruby/status/1367170867164295170&quot;&gt;recent tweet&lt;/a&gt; by the JRuby folks, let me know that the work I had done a while ago to get &lt;a href=&quot;https://sorbet.org/&quot;&gt;Sorbet&lt;/a&gt; working seemed to have gone under the radar.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;Sorbet is a fast, powerful type checker designed for Ruby.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;I wanted to reflect on it’s use at our current codebase, challenges still faced and where to go next.&lt;/p&gt;
+
+&lt;p&gt;If you want to cut ahead and start using Sorbet right away, I’ve contributed some &lt;a href=&quot;https://github.com/sorbet/sorbet/blob/master/docs/JRuby.md&quot;&gt;documentation&lt;/a&gt;.
+&lt;!--more--&gt;&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;/assets/images/jruby_sorbet_tweet.png&quot; alt=&quot;JRuby Sorbet Tweet&quot; width=&quot;500&quot; /&gt;&lt;/p&gt;
+
+&lt;h2 id=&quot;why-sorbet&quot;&gt;Why Sorbet?&lt;/h2&gt;
+
+&lt;p&gt;This was a surprisingly challenging argument to make to those only accustomed to working with Ruby. Those in the &lt;em&gt;thick&lt;/em&gt; of the codebase felt unencumbered by the lack of types and imagined it would only hinder their development.&lt;/p&gt;
+
+&lt;p&gt;I’ve come to appreciate that Ruby follows a simple axiom in which &lt;strong&gt;it favors the writer not the reader&lt;/strong&gt;. It’s what makes Ruby such a pleasure to write however a pain to read.&lt;/p&gt;
+
+&lt;p&gt;Thankfully, the tide has been turning for most languages. Python 3 has optional types, Typescript was introduced and types have been formally released in &lt;a href=&quot;https://github.com/ruby/rbs&quot;&gt;Ruby 3&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;Sorbet, aware of these hesitations, was designed with them in mind. It offers: gradual typing, runtime validation, static validation and is extremely fast on large codebases.&lt;/p&gt;
+
+&lt;h2 id=&quot;jruby-integration&quot;&gt;JRuby Integration&lt;/h2&gt;
+
+&lt;p&gt;Sorbet was not designed to work with JRuby in mind initially, however I found that not much was needed to get it working.&lt;/p&gt;
+
+&lt;h2 id=&quot;sorbet-static&quot;&gt;sorbet-static&lt;/h2&gt;
+
+&lt;p&gt;The primary blocker, which I’ve upstreamed was the creation of a Java platform gem for &lt;em&gt;sorbet-static&lt;/em&gt;. This means you can easily add it to any existing JRuby Gemfile and have the static binary available.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;If you are curious, checkout &lt;a href=&quot;https://github.com/sorbet/sorbet/commit/3c508a9c948a3b456cf564a5fb01279da1ffdc44&quot;&gt;3c508a9c948a3b456cf564a5fb01279da1ffdc44&lt;/a&gt;. We package the Darwin and Linux compiled binary within the gem.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h3 id=&quot;ruby-interface-files&quot;&gt;Ruby Interface Files&lt;/h3&gt;
+
+&lt;p&gt;Sorbet performs gradual typing and can easily be incorporated into large codebase, since it can auto-generate Ruby Interface (RBI) files for gems you include.&lt;/p&gt;
+
+&lt;p&gt;I found however that if your JRuby codebase calls out to Java-native code, the interpreter often-times fails to generate the RBI files.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;The technical reason is because the Java code is never officially required so that it never ends up being triggered through TracePoint&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;A pattern that worked well, was a hand-curated pattern for the creation of RBI files for the Java libraries the codebase uses.&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;tree ./sorbet
+|------ config
+|------ rbi
+    |-------- java
+    |   |---------- java_lang.rbi # this is the standard library
+    |   |---------- org_eclipse_jgit.rbi
+    |   |---------- org_apache_logging_log4j.rbi
+    |-------------  org_slf4j.rbi
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The naming convention is simple, it is the maven coordinates for a given Java package (replaced with underscores).&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;💡 There is an opportunity to include java_lang into &lt;a href=&quot;https://github.com/sorbet/sorbet-typed&quot;&gt;sorbet-typed&lt;/a&gt; at the very least.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;The RBI files can be as strongly typed as you desire.&lt;/p&gt;
+&lt;div class=&quot;language-ruby highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c1&quot;&gt;# typed: strong&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;module&lt;/span&gt; &lt;span class=&quot;nn&quot;&gt;Java&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;module&lt;/span&gt; &lt;span class=&quot;nn&quot;&gt;OrgEclipseJgitApiErrors&lt;/span&gt;
+    &lt;span class=&quot;k&quot;&gt;class&lt;/span&gt; &lt;span class=&quot;nc&quot;&gt;JGitInternalException&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;lt;&lt;/span&gt; &lt;span class=&quot;no&quot;&gt;Exception&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;;&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;h3 id=&quot;naming-convention&quot;&gt;Naming Convention&lt;/h3&gt;
+
+&lt;p&gt;Furthermore, there are a variety of ways in which to &lt;a href=&quot;https://github.com/jruby/jruby/wiki/CallingJavaFromJRuby&quot;&gt;call out to Java code&lt;/a&gt; from JRuby, but not all of them work for matching to the RBI files.&lt;/p&gt;
+
+&lt;p&gt;Consider these two approaches, which are &lt;em&gt;valid calling conventions&lt;/em&gt; into Java.&lt;/p&gt;
+&lt;div class=&quot;language-ruby highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c1&quot;&gt;# Option 1&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;org&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nf&quot;&gt;foo&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;nf&quot;&gt;department&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;no&quot;&gt;Widget&lt;/span&gt;
+
+&lt;span class=&quot;c1&quot;&gt;# Option 2&lt;/span&gt;
+&lt;span class=&quot;no&quot;&gt;Java&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;no&quot;&gt;OrgFooDepartment&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;::&lt;/span&gt;&lt;span class=&quot;no&quot;&gt;Widget&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Our codebase unfortunately &lt;strong&gt;heavily&lt;/strong&gt; favored the former, which to Sorbet resembles method calls as opposed to the latter being module namespacing.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;💡 There is an opportunity to fixup the code automatically via a Rubocop rule.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h3 id=&quot;disabling-runtime-verification&quot;&gt;Disabling Runtime Verification&lt;/h3&gt;
+
+&lt;p&gt;This has perhaps been the most upsetting thing, the runtime verification was disabled in the codebase. I had discovered (&lt;a href=&quot;https://github.com/sorbet/sorbet/issues/2316&quot;&gt;#2316&lt;/a&gt;) there are some concurrency-bugs with it since the Sorbet team primarily works with CRuby which still has a global lock (GIL).&lt;/p&gt;
+
+&lt;p&gt;We’ve had to resort to the following in our codebase.&lt;/p&gt;
+&lt;div class=&quot;language-ruby highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;c1&quot;&gt;# The Sorbet team develops strictly on MRI&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;# Discovered issue https://github.com/sorbet/sorbet/issues/2316&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;#&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;# To circumvent this, at the moment the `sorbet-runtime`&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;# is effectively changed to be T::Sig::WithoutRuntime&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;# https://github.com/sorbet/sorbet/blob/master/gems/sorbet/lib/t.rb&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;#&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;# We still leverage the static checker (srb tc) &amp;amp;&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;# using sig's as a form of documentation.&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;module&lt;/span&gt; &lt;span class=&quot;nn&quot;&gt;T::Sig&lt;/span&gt;
+  &lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;sig&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;arg&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;kp&quot;&gt;nil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;&amp;amp;&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;blk&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;);&lt;/span&gt; &lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;I am hoping with more attention and use by others in JRuby, this issue can be solved.&lt;/p&gt;
+
+&lt;h3 id=&quot;final-thoughts&quot;&gt;Final Thoughts&lt;/h3&gt;
+
+&lt;p&gt;Even without &lt;em&gt;runtime validation&lt;/em&gt;, the &lt;strong&gt;sig&lt;/strong&gt;’s use as a form of documentation far surpasses that of &lt;a href=&quot;https://yardoc.org/&quot;&gt;YARDOC&lt;/a&gt; and the &lt;em&gt;static checking&lt;/em&gt; continues to be helpful.&lt;/p&gt;
+
+&lt;p&gt;Without the ability to auto-generate RBI files for the code-base and the incorrect calling convention, we were not able to run &lt;strong&gt;srb init&lt;/strong&gt; over the whole codebase.&lt;/p&gt;
+
+&lt;p&gt;Instead, we’ve taken a tactical approach of refactoring modules into their own gem and at that time raising the requirement that all new gems require Sorbet typing.&lt;/p&gt;
+
+&lt;p&gt;Adoption has definitely slowed, since the cost of refactoring code into a distinct gem is as high as rewriting it natively in Java/Kotlin.&lt;/p&gt;
+
+&lt;p&gt;I look forward to Ruby 3 and wider adoption of typing in the Ruby ecosystem.&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;😞 I am dismayed that Ruby 3 did not chose to allow inline type signatures.&lt;/p&gt;
+&lt;/blockquote&gt;</content><author><name></name></author><summary type="html">A recent tweet by the JRuby folks, let me know that the work I had done a while ago to get Sorbet working seemed to have gone under the radar. Sorbet is a fast, powerful type checker designed for Ruby. I wanted to reflect on it’s use at our current codebase, challenges still faced and where to go next. If you want to cut ahead and start using Sorbet right away, I’ve contributed some documentation.</summary></entry></feed>
